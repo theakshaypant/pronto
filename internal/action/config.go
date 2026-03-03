@@ -29,11 +29,11 @@ type Config struct {
 // GitHub Actions expose inputs as environment variables with the pattern INPUT_<NAME>.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
-		GitHubToken:   getInput("github-token"),
-		LabelPattern:  getInput("label-pattern"),
-		ConflictLabel: getInput("conflict-label"),
-		BotName:       getInput("bot-name"),
-		BotEmail:      getInput("bot-email"),
+		GitHubToken:   getInput("github_token"),
+		LabelPattern:  getInput("label_pattern"),
+		ConflictLabel: getInput("conflict_label"),
+		BotName:       getInput("bot_name"),
+		BotEmail:      getInput("bot_email"),
 	}
 
 	// Validate required fields
@@ -87,7 +87,7 @@ func (c *Config) Validate() error {
 // GitHub Actions expose inputs as INPUT_<UPPERCASED_NAME> environment variables.
 func getInput(name string) string {
 	// Convert input name to environment variable format
-	// "github-token" -> "INPUT_GITHUB-TOKEN" -> "INPUT_GITHUB_TOKEN"
-	envName := "INPUT_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+	// "github_token" -> "INPUT_GITHUB_TOKEN"
+	envName := "INPUT_" + strings.ToUpper(name)
 	return os.Getenv(envName)
 }

@@ -287,15 +287,16 @@ func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHA
 
 	// Handle result
 	if result.Success {
-		return p.handleSuccessfulCherryPick(repo, targetBranch, commitMessages, hasWriteAccess, target.ShouldCreate, target.BaseBranch)
+		return p.handleSuccessfulCherryPick(repo, target, commitMessages, hasWriteAccess)
 	}
 
 	return p.handleConflictedCherryPick(repo, targetBranch, commitMessages, result)
 }
 
 // handleSuccessfulCherryPick handles a successful cherry-pick.
-func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, hasWriteAccess bool, branchCreated bool, baseBranch string) ProcessResult {
+func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *models.TargetBranch, commitMessages []string, hasWriteAccess bool) ProcessResult {
 	pr := p.event.PullRequest
+	targetBranch := target.Name
 
 	if hasWriteAccess {
 		// User has write access - push directly
@@ -310,9 +311,43 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, targetBra
 
 		log.Printf("Successfully cherry-picked to %s", targetBranch)
 
+		// Create tag if specified
+		if target.TagName != "" {
+			log.Printf("Creating tag %s for branch %s", target.TagName, targetBranch)
+
+			tagMessage := fmt.Sprintf("Cherry-picked PR #%d to %s\n\nOriginal PR: #%d\nCommits: %d",
+				pr.GetNumber(), targetBranch, pr.GetNumber(), len(commitMessages))
+
+			if err := repo.CreateTag(target.TagName, tagMessage); err != nil {
+				// Tag creation failed - log but don't fail the whole operation
+				log.Printf("Failed to create tag %s: %v", target.TagName, err)
+				return ProcessResult{
+					TargetBranch: targetBranch,
+					Success:      false,
+					Message:      fmt.Sprintf("❌ Cherry-pick succeeded but tag creation failed: %v", err),
+				}
+			}
+
+			// Push the tag
+			if err := repo.PushTag("origin", target.TagName); err != nil {
+				log.Printf("Failed to push tag %s: %v", target.TagName, err)
+				return ProcessResult{
+					TargetBranch: targetBranch,
+					Success:      false,
+					Message:      fmt.Sprintf("❌ Cherry-pick and tag creation succeeded but tag push failed: %v", err),
+				}
+			}
+
+			log.Printf("Successfully created and pushed tag %s", target.TagName)
+		}
+
+		// Build success message
 		msg := fmt.Sprintf("✅ Successfully cherry-picked %d commit(s)", len(commitMessages))
-		if branchCreated {
-			msg = fmt.Sprintf("✅ Created branch from `%s` and cherry-picked %d commit(s)", baseBranch, len(commitMessages))
+		if target.ShouldCreate {
+			msg = fmt.Sprintf("✅ Created branch from `%s` and cherry-picked %d commit(s)", target.BaseBranch, len(commitMessages))
+		}
+		if target.TagName != "" {
+			msg += fmt.Sprintf(", created tag `%s`", target.TagName)
 		}
 
 		return ProcessResult{

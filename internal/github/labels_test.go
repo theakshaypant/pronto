@@ -14,6 +14,7 @@ func TestParseBranchSpec(t *testing.T) {
 		wantName     string
 		wantBase     string
 		wantCreate   bool
+		wantTag      string
 		wantNil      bool
 	}{
 		{
@@ -76,6 +77,80 @@ func TestParseBranchSpec(t *testing.T) {
 			spec:    "release-1.0..main branch",
 			wantNil: true,
 		},
+		// Tag notation tests
+		{
+			name:       "simple branch with tag",
+			spec:       "release-1.0?tag=v1.0.1",
+			wantName:   "release-1.0",
+			wantBase:   "",
+			wantCreate: false,
+			wantTag:    "v1.0.1",
+		},
+		{
+			name:       "branch creation with tag",
+			spec:       "release-1.0..main?tag=v1.0.0",
+			wantName:   "release-1.0",
+			wantBase:   "main",
+			wantCreate: true,
+			wantTag:    "v1.0.0",
+		},
+		{
+			name:       "tag with semantic version",
+			spec:       "release-2.0?tag=v2.0.0-beta.1",
+			wantName:   "release-2.0",
+			wantBase:   "",
+			wantCreate: false,
+			wantTag:    "v2.0.0-beta.1",
+		},
+		{
+			name:       "tag with custom name",
+			spec:       "hotfix-1.5?tag=hotfix-123",
+			wantName:   "hotfix-1.5",
+			wantBase:   "",
+			wantCreate: false,
+			wantTag:    "hotfix-123",
+		},
+		{
+			name:       "branch with @ and tag",
+			spec:       "release@user-1.0?tag=v1.0.1",
+			wantName:   "release@user-1.0",
+			wantBase:   "",
+			wantCreate: false,
+			wantTag:    "v1.0.1",
+		},
+		{
+			name:       "branch creation with @ and tag",
+			spec:       "release-1.0..feature@alice?tag=v1.0.0",
+			wantName:   "release-1.0",
+			wantBase:   "feature@alice",
+			wantCreate: true,
+			wantTag:    "v1.0.0",
+		},
+		{
+			name:    "invalid - empty tag",
+			spec:    "release-1.0?tag=",
+			wantNil: true,
+		},
+		{
+			name:    "invalid - tag with spaces",
+			spec:    "release-1.0?tag=v1.0.1 beta",
+			wantNil: true,
+		},
+		{
+			name:    "invalid - tag starts with period",
+			spec:    "release-1.0?tag=.hidden",
+			wantNil: true,
+		},
+		{
+			name:    "invalid - tag starts with hyphen",
+			spec:    "release-1.0?tag=-invalid",
+			wantNil: true,
+		},
+		{
+			name:    "invalid - tag contains ..",
+			spec:    "release-1.0?tag=v1..0",
+			wantNil: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -103,6 +178,10 @@ func TestParseBranchSpec(t *testing.T) {
 
 			if result.ShouldCreate != tt.wantCreate {
 				t.Errorf("ShouldCreate = %v, want %v", result.ShouldCreate, tt.wantCreate)
+			}
+
+			if result.TagName != tt.wantTag {
+				t.Errorf("TagName = %q, want %q", result.TagName, tt.wantTag)
 			}
 		})
 	}
@@ -162,6 +241,75 @@ func TestParseTargetBranches(t *testing.T) {
 			},
 			pattern: "pronto/",
 			want:    1, // should deduplicate
+		},
+		{
+			name: "branches with tags",
+			labels: []*github.Label{
+				{Name: github.Ptr("pronto/release-1.0?tag=v1.0.1")},
+				{Name: github.Ptr("pronto/release-2.0?tag=v2.0.0")},
+			},
+			pattern: "pronto/",
+			want:    2,
+			checks: []func(*testing.T, []*models.TargetBranch){
+				func(t *testing.T, branches []*models.TargetBranch) {
+					if branches[0].TagName != "v1.0.1" {
+						t.Errorf("First branch TagName = %q, want v1.0.1", branches[0].TagName)
+					}
+					if branches[1].TagName != "v2.0.0" {
+						t.Errorf("Second branch TagName = %q, want v2.0.0", branches[1].TagName)
+					}
+				},
+			},
+		},
+		{
+			name: "branch creation with tag",
+			labels: []*github.Label{
+				{Name: github.Ptr("pronto/release-1.0..main?tag=v1.0.0")},
+			},
+			pattern: "pronto/",
+			want:    1,
+			checks: []func(*testing.T, []*models.TargetBranch){
+				func(t *testing.T, branches []*models.TargetBranch) {
+					if !branches[0].ShouldCreate {
+						t.Error("Branch should have ShouldCreate=true")
+					}
+					if branches[0].BaseBranch != "main" {
+						t.Errorf("Branch BaseBranch = %q, want main", branches[0].BaseBranch)
+					}
+					if branches[0].TagName != "v1.0.0" {
+						t.Errorf("Branch TagName = %q, want v1.0.0", branches[0].TagName)
+					}
+				},
+			},
+		},
+		{
+			name: "mixed branches with and without tags",
+			labels: []*github.Label{
+				{Name: github.Ptr("pronto/release-1.0?tag=v1.0.1")},
+				{Name: github.Ptr("pronto/release-2.0")}, // no tag
+				{Name: github.Ptr("pronto/hotfix-1.5..release-1.0?tag=hotfix-123")},
+			},
+			pattern: "pronto/",
+			want:    3,
+			checks: []func(*testing.T, []*models.TargetBranch){
+				func(t *testing.T, branches []*models.TargetBranch) {
+					// First branch should have tag
+					if branches[0].TagName != "v1.0.1" {
+						t.Errorf("First branch TagName = %q, want v1.0.1", branches[0].TagName)
+					}
+					// Second branch should NOT have tag
+					if branches[1].TagName != "" {
+						t.Errorf("Second branch TagName = %q, want empty", branches[1].TagName)
+					}
+					// Third branch should have tag and base
+					if branches[2].TagName != "hotfix-123" {
+						t.Errorf("Third branch TagName = %q, want hotfix-123", branches[2].TagName)
+					}
+					if branches[2].BaseBranch != "release-1.0" {
+						t.Errorf("Third branch BaseBranch = %q, want release-1.0", branches[2].BaseBranch)
+					}
+				},
+			},
 		},
 	}
 

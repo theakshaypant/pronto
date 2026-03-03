@@ -136,6 +136,46 @@ func (r *Repository) Push(remote, branch string, force bool) error {
 	return nil
 }
 
+// CreateTag creates an annotated tag at the current HEAD.
+func (r *Repository) CreateTag(tagName, message string) error {
+	if tagName == "" {
+		return fmt.Errorf("tag name cannot be empty")
+	}
+
+	args := []string{"tag", "-a", tagName, "-m", message}
+
+	if err := r.exec(args...); err != nil {
+		// Check if tag already exists
+		if strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("tag %s already exists", tagName)
+		}
+		return fmt.Errorf("failed to create tag %s: %w", tagName, err)
+	}
+
+	return nil
+}
+
+// PushTag pushes a tag to remote.
+func (r *Repository) PushTag(remote, tagName string) error {
+	if tagName == "" {
+		return fmt.Errorf("tag name cannot be empty")
+	}
+
+	// Build authenticated remote URL if token is provided
+	if r.token != "" {
+		authRemote := strings.Replace(r.remote, "https://", fmt.Sprintf("https://%s@", r.token), 1)
+		if err := r.exec("remote", "set-url", remote, authRemote); err != nil {
+			return fmt.Errorf("failed to set authenticated remote: %w", err)
+		}
+	}
+
+	if err := r.exec("push", remote, tagName); err != nil {
+		return fmt.Errorf("failed to push tag %s: %w", tagName, err)
+	}
+
+	return nil
+}
+
 // GetCurrentBranch returns the name of the current branch.
 func (r *Repository) GetCurrentBranch() (string, error) {
 	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")

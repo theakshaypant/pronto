@@ -61,13 +61,16 @@ func run() error {
 
 	log.Printf("Processing pull request #%d (action: %s)", *prEvent.PullRequest.Number, eventAction)
 
-	// TODO: Phase 3+ will add actual processing logic here
-	// - GitHub client initialization
-	// - Permission checking
-	// - Label parsing
-	// - Cherry-pick operations
+	// Create PR processor
+	processor, err := events.NewPRProcessor(ctx, cfg, prEvent)
+	if err != nil {
+		return fmt.Errorf("failed to create PR processor: %w", err)
+	}
 
-	log.Println("WARNING: Core processing not yet implemented - will be added in Phase 3+")
+	// Process the pull request event
+	if err := processor.Process(eventAction); err != nil {
+		return fmt.Errorf("failed to process pull request: %w", err)
+	}
 
 	return nil
 }

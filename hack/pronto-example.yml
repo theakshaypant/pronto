@@ -1,0 +1,31 @@
+name: PROnto - Automated Cherry-pick
+
+on:
+  pull_request:
+    types: [labeled, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  pronto:
+    name: Automated Cherry-pick
+    runs-on: ubuntu-latest
+
+    # Only run if PR is merged
+    if: github.event.pull_request.merged == true
+
+    steps:
+      - name: PROnto
+        uses: theakshaypant/pronto@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Optional: customize label pattern (default: pronto/)
+          # label_pattern: 'pronto/'
+          # Optional: customize conflict label (default: pronto-conflict)
+          # conflict_label: 'pronto-conflict'
+          # Optional: customize bot name (default: PROnto Bot)
+          # bot_name: 'PROnto Bot'
+          # Optional: customize bot email
+          # bot_email: 'bot@example.com'

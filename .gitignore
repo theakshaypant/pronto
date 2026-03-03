@@ -4,7 +4,6 @@
 *.dll
 *.so
 *.dylib
-^pronto/
 
 # Test binary, built with `go test -c`
 *.test
@@ -41,3 +40,4 @@ temp/
 # Build artifacts
 dist/
 build/
+/pronto

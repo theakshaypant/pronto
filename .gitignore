@@ -4,7 +4,7 @@
 *.dll
 *.so
 *.dylib
-pronto
+^pronto/
 
 # Test binary, built with `go test -c`
 *.test

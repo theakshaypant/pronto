@@ -152,9 +152,10 @@ Customize behavior with inputs:
 ### 3. Use in Your Workflow
 
 1. **Merge PR to main**
-2. **Add label**: `pronto/release-1.0`
+2. **Add label**: `pronto/release-1.0` or `pronto/release-1.0?tag=v1.0.1`
 3. **Done!** PROnto automatically:
    - Cherry-picks commits
+   - Creates Git tags (if specified)
    - Handles conflicts
    - Creates PRs if needed
 
@@ -167,6 +168,13 @@ Customize behavior with inputs:
 gh pr edit <PR> --add-label "pronto/release-1.0"
 ```
 
+### Backport with Git tag
+
+```bash
+# Cherry-pick and create a tag
+gh pr edit <PR> --add-label "pronto/release-1.0?tag=v1.0.1"
+```
+
 ### Create new release branch
 
 ```bash
@@ -174,14 +182,21 @@ gh pr edit <PR> --add-label "pronto/release-1.0"
 gh pr edit <PR> --add-label "pronto/release-2.0..main"
 ```
 
+### Create branch and tag
+
+```bash
+# Create branch, cherry-pick, and tag
+gh pr edit <PR> --add-label "pronto/release-2.0..main?tag=v2.0.0"
+```
+
 ### Backport to multiple releases
 
 ```bash
-# Add multiple labels
+# Add multiple labels (with selective tagging)
 gh pr edit <PR> \
-  --add-label "pronto/release-1.0" \
+  --add-label "pronto/release-1.0?tag=v1.0.1" \
   --add-label "pronto/release-2.0" \
-  --add-label "pronto/release-3.0"
+  --add-label "pronto/release-3.0?tag=v3.0.0"
 ```
 
 ## Troubleshooting

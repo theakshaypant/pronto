@@ -1,0 +1,38 @@
+# Ignore everything by default
+*
+
+# Allow specific files and directories
+!cmd/
+!internal/
+!pkg/
+!go.mod
+!go.sum
+
+# Ignore test files
+**/*_test.go
+tests/
+
+# Ignore build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore documentation
+*.md
+!README.md
+
+# Ignore CI/CD
+.github/

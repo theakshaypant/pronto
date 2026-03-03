@@ -1,0 +1,31 @@
+name: 'PROnto'
+description: 'Automate cherry-picking PR-onto release branches using labels'
+author: 'Akshay Pant'
+branding:
+  icon: 'git-branch'
+  color: 'purple'
+
+inputs:
+  github-token:
+    description: 'GitHub token for API access (typically secrets.GITHUB_TOKEN)'
+    required: true
+  label-pattern:
+    description: 'Label prefix to match for target branches (e.g., "pronto/" matches "pronto/release-1.0")'
+    required: false
+    default: 'pronto/'
+  conflict-label:
+    description: 'Label to apply to PRs created when cherry-pick conflicts occur'
+    required: false
+    default: 'cherry-pick-conflict'
+  bot-name:
+    description: 'Git committer name for cherry-pick commits'
+    required: false
+    default: 'PROnto Bot'
+  bot-email:
+    description: 'Git committer email for cherry-pick commits'
+    required: false
+    default: 'pronto[bot]@users.noreply.github.com'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'

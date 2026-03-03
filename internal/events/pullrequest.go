@@ -27,6 +27,14 @@ type PRProcessor struct {
 	event       *github.PullRequestEvent
 }
 
+// ProcessResult tracks the result of processing a single target branch.
+type ProcessResult struct {
+	TargetBranch string
+	Success      bool
+	Message      string
+	CreatedPR    int // PR number if a new PR was created
+}
+
 // NewPRProcessor creates a new pull request processor.
 func NewPRProcessor(ctx context.Context, cfg *action.Config, event *github.PullRequestEvent) (*PRProcessor, error) {
 	// Perform comprehensive validation
@@ -113,13 +121,23 @@ func (p *PRProcessor) Process(action EventAction) error {
 
 	log.Printf("PR has %d commit(s)", len(commitSHAs))
 
-	// Process each target branch
+	// Process each target branch and collect results
+	var results []ProcessResult
 	for _, targetBranch := range targetBranches {
 		log.Printf("Processing target branch: %s", targetBranch.Name)
 
-		if err := p.processTargetBranch(targetBranch, commitSHAs, commitMessages, hasWriteAccess); err != nil {
-			log.Printf("Error processing branch %s: %v", targetBranch.Name, err)
-			// Continue with other branches even if one fails
+		result := p.processTargetBranch(targetBranch, commitSHAs, commitMessages, hasWriteAccess)
+		results = append(results, result)
+
+		if !result.Success {
+			log.Printf("Error processing branch %s: %s", targetBranch.Name, result.Message)
+		}
+	}
+
+	// Create a single summary comment with all results
+	if len(results) > 0 {
+		if err := p.createSummaryComment(results); err != nil {
+			log.Printf("Failed to create summary comment: %v", err)
 		}
 	}
 
@@ -127,14 +145,18 @@ func (p *PRProcessor) Process(action EventAction) error {
 }
 
 // processTargetBranch handles cherry-picking to a single target branch.
-func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHAs, commitMessages []string, hasWriteAccess bool) error {
+func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHAs, commitMessages []string, hasWriteAccess bool) ProcessResult {
 	pr := p.event.PullRequest
 	targetBranch := target.Name
 
 	// Check if target branch exists
 	exists, err := p.ghClient.BranchExists(p.ctx, targetBranch)
 	if err != nil {
-		return fmt.Errorf("failed to check if branch exists: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to check if branch exists: %v", err),
+		}
 	}
 
 	// Handle branch creation if specified with .. notation
@@ -144,61 +166,61 @@ func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHA
 		// Verify base branch exists
 		baseExists, err := p.ghClient.BranchExists(p.ctx, target.BaseBranch)
 		if err != nil {
-			return fmt.Errorf("failed to check if base branch exists: %w", err)
+			return ProcessResult{
+				TargetBranch: targetBranch,
+				Success:      false,
+				Message:      fmt.Sprintf("❌ Failed to check if base branch `%s` exists: %v", target.BaseBranch, err),
+			}
 		}
 
 		if !baseExists {
-			comment := fmt.Sprintf(
-				"⚠️ **PROnto Notice**: Cannot create branch `%s` because the base branch `%s` does not exist.\n\n"+
-					"Please check the label format or create the base branch first.\n\n"+
-					"---\n"+
-					"🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)",
-				targetBranch,
-				target.BaseBranch,
-			)
-			if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
-				log.Printf("Failed to add missing base branch comment: %v", err)
+			return ProcessResult{
+				TargetBranch: targetBranch,
+				Success:      false,
+				Message:      fmt.Sprintf("⚠️ Cannot create branch because the base branch `%s` does not exist. Please check the label format or create the base branch first.", target.BaseBranch),
 			}
-			return nil
 		}
 
 		// Get base branch SHA
 		baseSHA, err := p.ghClient.GetBranchSHA(p.ctx, target.BaseBranch)
 		if err != nil {
-			return fmt.Errorf("failed to get base branch SHA: %w", err)
+			return ProcessResult{
+				TargetBranch: targetBranch,
+				Success:      false,
+				Message:      fmt.Sprintf("❌ Failed to get base branch SHA: %v", err),
+			}
 		}
 
 		// Create the target branch
 		if err := p.ghClient.CreateBranch(p.ctx, targetBranch, baseSHA); err != nil {
-			return fmt.Errorf("failed to create target branch: %w", err)
+			return ProcessResult{
+				TargetBranch: targetBranch,
+				Success:      false,
+				Message:      fmt.Sprintf("❌ Failed to create target branch: %v", err),
+			}
 		}
 
 		log.Printf("Successfully created branch %s from %s", targetBranch, target.BaseBranch)
-
-		// Add comment about branch creation
-		comment := fmt.Sprintf(
-			"✅ **PROnto**: Created branch `%s` from `%s` and will now cherry-pick commits.",
-			targetBranch,
-			target.BaseBranch,
-		)
-		if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
-			log.Printf("Failed to add branch creation comment: %v", err)
-		}
+		// Continue processing to cherry-pick to the newly created branch
 	} else if !exists {
 		// Branch doesn't exist and no .. notation specified
-		log.Printf("Branch %s does not exist, adding comment to PR", targetBranch)
-		comment := ghclient.FormatMissingBranchComment(targetBranch, p.config.LabelPattern)
-		if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
-			log.Printf("Failed to add missing branch comment: %v", err)
+		log.Printf("Branch %s does not exist", targetBranch)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("⚠️ Branch does not exist. Use label `%s%s..base-branch` to create it automatically.", p.config.LabelPattern, targetBranch),
 		}
-		return nil
 	}
 
 	// Check deduplication - prevent processing the same PR/branch/SHA combination
 	headSHA := pr.GetHead().GetSHA()
 	if !p.tracker.ShouldProcess(pr.GetNumber(), targetBranch, headSHA) {
 		log.Printf("Already processed PR #%d to branch %s at SHA %s, skipping", pr.GetNumber(), targetBranch, headSHA[:7])
-		return nil
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      true,
+			Message:      "⏭️ Already processed (skipped duplicate)",
+		}
 	}
 
 	// Mark as processed to prevent duplicate processing from webhook retries
@@ -207,7 +229,11 @@ func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHA
 	// Create temporary directory for git operations
 	tempDir, err := os.MkdirTemp("", "pronto-*")
 	if err != nil {
-		return fmt.Errorf("failed to create temp directory: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to create temp directory: %v", err),
+		}
 	}
 	defer os.RemoveAll(tempDir)
 
@@ -222,63 +248,87 @@ func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHA
 		Depth:     0, // Full clone needed for cherry-pick
 	})
 	if err != nil {
-		return fmt.Errorf("failed to clone repository: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to clone repository: %v", err),
+		}
 	}
 
 	// Configure git user
 	if err := repo.ConfigUser(p.config.BotName, p.config.BotEmail); err != nil {
-		return fmt.Errorf("failed to configure git user: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to configure git user: %v", err),
+		}
 	}
 
 	// Checkout target branch
 	log.Printf("Checking out target branch: %s", targetBranch)
 	if err := repo.Checkout(targetBranch); err != nil {
-		return fmt.Errorf("failed to checkout target branch: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to checkout target branch: %v", err),
+		}
 	}
 
 	// Perform cherry-pick
 	log.Printf("Cherry-picking %d commit(s)", len(commitSHAs))
 	result, err := repo.CherryPick(commitSHAs...)
 	if err != nil {
-		return fmt.Errorf("cherry-pick operation failed: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Cherry-pick operation failed: %v", err),
+		}
 	}
 
 	// Handle result
 	if result.Success {
-		return p.handleSuccessfulCherryPick(repo, targetBranch, commitMessages, hasWriteAccess)
+		return p.handleSuccessfulCherryPick(repo, targetBranch, commitMessages, hasWriteAccess, target.ShouldCreate, target.BaseBranch)
 	}
 
-	return p.handleConflictedCherryPick(repo, targetBranch, commitSHAs, commitMessages, result)
+	return p.handleConflictedCherryPick(repo, targetBranch, commitMessages, result)
 }
 
 // handleSuccessfulCherryPick handles a successful cherry-pick.
-func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, hasWriteAccess bool) error {
+func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, hasWriteAccess bool, branchCreated bool, baseBranch string) ProcessResult {
 	pr := p.event.PullRequest
 
 	if hasWriteAccess {
 		// User has write access - push directly
 		log.Printf("Pushing cherry-picked commits to %s", targetBranch)
 		if err := repo.Push("origin", targetBranch, false); err != nil {
-			return fmt.Errorf("failed to push to target branch: %w", err)
-		}
-
-		// Add success comment
-		comment := ghclient.FormatSuccessComment(targetBranch, commitMessages)
-		if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
-			log.Printf("Failed to add success comment: %v", err)
+			return ProcessResult{
+				TargetBranch: targetBranch,
+				Success:      false,
+				Message:      fmt.Sprintf("❌ Failed to push to target branch: %v", err),
+			}
 		}
 
 		log.Printf("Successfully cherry-picked to %s", targetBranch)
-		return nil
+
+		msg := fmt.Sprintf("✅ Successfully cherry-picked %d commit(s)", len(commitMessages))
+		if branchCreated {
+			msg = fmt.Sprintf("✅ Created branch from `%s` and cherry-picked %d commit(s)", baseBranch, len(commitMessages))
+		}
+
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      true,
+			Message:      msg,
+		}
 	}
 
 	// User lacks write access - create fallback PR
 	log.Printf("User lacks write access, creating fallback PR")
-	return p.createFallbackPR(repo, targetBranch, commitMessages, "")
+	return p.createFallbackPR(repo, targetBranch, commitMessages, "", pr.GetNumber())
 }
 
 // handleConflictedCherryPick handles a cherry-pick with conflicts.
-func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBranch string, commitSHAs, commitMessages []string, result *git.CherryPickResult) error {
+func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, result *git.CherryPickResult) ProcessResult {
 	log.Printf("Cherry-pick resulted in conflicts for branch %s", targetBranch)
 
 	// Get conflict details
@@ -288,31 +338,62 @@ func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBra
 		details = fmt.Sprintf("Conflicts in %d file(s)", len(result.ConflictedFiles))
 	}
 
-	// Create conflict PR
-	return p.createConflictPR(targetBranch, commitMessages, details)
+	// Extract commit SHAs for the instructions
+	cherryPickSHAs := extractCommitSHAsFromMessages(commitMessages)
+	cherryPickCmd := "git cherry-pick " + strings.Join(cherryPickSHAs, " ")
+
+	msg := fmt.Sprintf("⚠️ Cherry-pick resulted in conflicts. Manual resolution required.\n\n"+
+		"**Conflict Details:**\n```\n%s\n```\n\n"+
+		"**Commands to resolve:**\n```bash\n"+
+		"git checkout %s\n"+
+		"git pull origin %s\n"+
+		"%s\n"+
+		"# Resolve conflicts, then:\n"+
+		"git add .\n"+
+		"git cherry-pick --continue\n"+
+		"git push origin %s\n"+
+		"```",
+		details,
+		targetBranch,
+		targetBranch,
+		cherryPickCmd,
+		targetBranch,
+	)
+
+	return ProcessResult{
+		TargetBranch: targetBranch,
+		Success:      false,
+		Message:      msg,
+	}
 }
 
 // createFallbackPR creates a PR for users without write access.
-func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string, commitMessages []string, conflictDetails string) error {
-	pr := p.event.PullRequest
-
+func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string, commitMessages []string, conflictDetails string, prNumber int) ProcessResult {
 	// Create a new branch for the fallback PR
-	branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch, pr.GetNumber())
+	branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch, prNumber)
 
 	log.Printf("Creating fallback branch: %s", branchName)
 	if err := repo.CreateBranch(branchName); err != nil {
-		return fmt.Errorf("failed to create fallback branch: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to create fallback branch: %v", err),
+		}
 	}
 
 	// Push the branch
 	log.Printf("Pushing fallback branch to origin")
 	if err := repo.Push("origin", branchName, false); err != nil {
-		return fmt.Errorf("failed to push fallback branch: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to push fallback branch: %v", err),
+		}
 	}
 
 	// Create PR
-	prBody := ghclient.FormatConflictPRBody(pr.GetNumber(), targetBranch, commitMessages, conflictDetails)
-	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", pr.GetNumber(), targetBranch)
+	prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch, commitMessages, conflictDetails)
+	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", prNumber, targetBranch)
 
 	// Always add "pronto" label to identify auto-created PRs
 	labels := []string{"pronto"}
@@ -328,68 +409,64 @@ func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string
 		Labels: labels,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create fallback PR: %w", err)
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to create fallback PR: %v", err),
+		}
 	}
 
 	log.Printf("Created fallback PR #%d", newPR.GetNumber())
 
-	// Add comment to original PR
-	comment := fmt.Sprintf("✅ Created fallback PR #%d for cherry-picking to `%s`", newPR.GetNumber(), targetBranch)
-	if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
-		log.Printf("Failed to add fallback PR comment: %v", err)
+	return ProcessResult{
+		TargetBranch: targetBranch,
+		Success:      true,
+		Message:      fmt.Sprintf("✅ Created PR #%d (no write access)", newPR.GetNumber()),
+		CreatedPR:    newPR.GetNumber(),
 	}
-
-	return nil
 }
 
-// createConflictPR creates a PR with conflict markers for manual resolution.
-func (p *PRProcessor) createConflictPR(targetBranch string, commitMessages []string, conflictDetails string) error {
+// createSummaryComment creates a single summary comment with all processing results.
+func (p *PRProcessor) createSummaryComment(results []ProcessResult) error {
 	pr := p.event.PullRequest
 
-	// For conflicts, we need to create a branch with the conflicts preserved
-	// Since we aborted the cherry-pick, we need to do it again but keep the conflicts
-	// For now, just add a comment explaining the conflict
+	var sb strings.Builder
+	sb.WriteString("## 🤖 PROnto Summary\n\n")
 
-	// Extract commit SHAs for the instructions
-	commitSHAs := extractCommitSHAsFromMessages(commitMessages)
-	cherryPickCmd := "git cherry-pick " + strings.Join(commitSHAs, " ")
-
-	comment := fmt.Sprintf(
-		"⚠️ **PROnto Conflict**: Cherry-picking PR #%d to `%s` resulted in conflicts.\n\n"+
-			"**Commits:**\n%s\n\n"+
-			"**Conflict Details:**\n```\n%s\n```\n\n"+
-			"### 🛠️ How to Resolve Conflicts\n\n"+
-			"To resolve the conflicts locally, run:\n\n"+
-			"```bash\n"+
-			"# Checkout the target branch\n"+
-			"git checkout %s\n"+
-			"git pull origin %s\n\n"+
-			"# Cherry-pick the commits\n"+
-			"%s\n\n"+
-			"# Resolve conflicts in the affected files\n"+
-			"# Edit the conflicted files, then:\n"+
-			"git add .\n"+
-			"git cherry-pick --continue\n\n"+
-			"# Push the changes\n"+
-			"git push origin %s\n"+
-			"```\n\n"+
-			"---\n"+
-			"🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)",
-		pr.GetNumber(),
-		targetBranch,
-		formatCommitList(commitMessages),
-		conflictDetails,
-		targetBranch,
-		targetBranch,
-		cherryPickCmd,
-		targetBranch,
-	)
-
-	if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
-		return fmt.Errorf("failed to add conflict comment: %w", err)
+	// Group results by success/failure
+	var successes, failures []ProcessResult
+	for _, r := range results {
+		if r.Success {
+			successes = append(successes, r)
+		} else {
+			failures = append(failures, r)
+		}
 	}
 
-	log.Printf("Added conflict comment to PR #%d for branch %s", pr.GetNumber(), targetBranch)
+	// Show successes first
+	if len(successes) > 0 {
+		for _, r := range successes {
+			fmt.Fprintf(&sb, "**`%s`**: %s\n\n", r.TargetBranch, r.Message)
+		}
+	}
+
+	// Then show failures
+	if len(failures) > 0 {
+		for _, r := range failures {
+			fmt.Fprintf(&sb, "**`%s`**: %s\n\n", r.TargetBranch, r.Message)
+		}
+	}
+
+	sb.WriteString("---\n")
+	sb.WriteString("🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)")
+
+	comment := sb.String()
+
+	if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
+		return fmt.Errorf("failed to add summary comment: %w", err)
+	}
+
+	log.Printf("Added summary comment to PR #%d with %d results", pr.GetNumber(), len(results))
 	return nil
 }
 
@@ -432,13 +509,3 @@ func (p *PRProcessor) getUserForPermissionCheck(action EventAction) string {
 	return ""
 }
 
-// formatCommitList formats commit messages as a bulleted list.
-func formatCommitList(messages []string) string {
-	var sb strings.Builder
-	for _, msg := range messages {
-		sb.WriteString("- ")
-		sb.WriteString(msg)
-		sb.WriteString("\n")
-	}
-	return sb.String()
-}

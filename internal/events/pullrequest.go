@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-github/v81/github"
 	"github.com/theakshaypant/pronto/internal/action"
+	"github.com/theakshaypant/pronto/internal/deduplication"
 	ghclient "github.com/theakshaypant/pronto/internal/github"
 	"github.com/theakshaypant/pronto/internal/git"
 	"github.com/theakshaypant/pronto/internal/permissions"
@@ -16,11 +17,12 @@ import (
 
 // PRProcessor handles pull request events for cherry-picking.
 type PRProcessor struct {
-	ctx        context.Context
-	config     *action.Config
-	ghClient   *ghclient.Client
+	ctx         context.Context
+	config      *action.Config
+	ghClient    *ghclient.Client
 	permChecker *permissions.Checker
-	event      *github.PullRequestEvent
+	tracker     *deduplication.Tracker
+	event       *github.PullRequestEvent
 }
 
 // NewPRProcessor creates a new pull request processor.
@@ -41,11 +43,15 @@ func NewPRProcessor(ctx context.Context, cfg *action.Config, event *github.PullR
 	// Create permission checker
 	permChecker := permissions.NewChecker(client.GetClient(), owner, repo)
 
+	// Create deduplication tracker
+	tracker := deduplication.NewTracker()
+
 	return &PRProcessor{
 		ctx:         ctx,
 		config:      cfg,
 		ghClient:    client,
 		permChecker: permChecker,
+		tracker:     tracker,
 		event:       event,
 	}, nil
 }
@@ -130,6 +136,16 @@ func (p *PRProcessor) processTargetBranch(targetBranch string, commitSHAs, commi
 		}
 		return nil
 	}
+
+	// Check deduplication - prevent processing the same PR/branch/SHA combination
+	headSHA := pr.GetHead().GetSHA()
+	if !p.tracker.ShouldProcess(pr.GetNumber(), targetBranch, headSHA) {
+		log.Printf("Already processed PR #%d to branch %s at SHA %s, skipping", pr.GetNumber(), targetBranch, headSHA[:7])
+		return nil
+	}
+
+	// Mark as processed to prevent duplicate processing from webhook retries
+	defer p.tracker.MarkProcessed(pr.GetNumber(), targetBranch, headSHA)
 
 	// Create temporary directory for git operations
 	tempDir, err := os.MkdirTemp("", "pronto-*")

@@ -16,7 +16,7 @@ inputs:
   conflict-label:
     description: 'Label to apply to PRs created when cherry-pick conflicts occur'
     required: false
-    default: 'cherry-pick-conflict'
+    default: 'pronto-conflict'
   bot-name:
     description: 'Git committer name for cherry-pick commits'
     required: false

@@ -264,7 +264,8 @@ func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string
 	prBody := ghclient.FormatConflictPRBody(pr.GetNumber(), targetBranch, commitMessages, conflictDetails)
 	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", pr.GetNumber(), targetBranch)
 
-	labels := []string{}
+	// Always add "pronto" label to identify auto-created PRs
+	labels := []string{"pronto"}
 	if conflictDetails != "" {
 		labels = append(labels, p.config.ConflictLabel)
 	}
@@ -299,17 +300,39 @@ func (p *PRProcessor) createConflictPR(targetBranch string, commitMessages []str
 	// Since we aborted the cherry-pick, we need to do it again but keep the conflicts
 	// For now, just add a comment explaining the conflict
 
+	// Extract commit SHAs for the instructions
+	commitSHAs := extractCommitSHAsFromMessages(commitMessages)
+	cherryPickCmd := "git cherry-pick " + strings.Join(commitSHAs, " ")
+
 	comment := fmt.Sprintf(
 		"⚠️ **PROnto Conflict**: Cherry-picking PR #%d to `%s` resulted in conflicts.\n\n"+
 			"**Commits:**\n%s\n\n"+
 			"**Conflict Details:**\n```\n%s\n```\n\n"+
-			"Please resolve conflicts manually.\n\n"+
+			"### 🛠️ How to Resolve Conflicts\n\n"+
+			"To resolve the conflicts locally, run:\n\n"+
+			"```bash\n"+
+			"# Checkout the target branch\n"+
+			"git checkout %s\n"+
+			"git pull origin %s\n\n"+
+			"# Cherry-pick the commits\n"+
+			"%s\n\n"+
+			"# Resolve conflicts in the affected files\n"+
+			"# Edit the conflicted files, then:\n"+
+			"git add .\n"+
+			"git cherry-pick --continue\n\n"+
+			"# Push the changes\n"+
+			"git push origin %s\n"+
+			"```\n\n"+
 			"---\n"+
 			"🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)",
 		pr.GetNumber(),
 		targetBranch,
 		formatCommitList(commitMessages),
 		conflictDetails,
+		targetBranch,
+		targetBranch,
+		cherryPickCmd,
+		targetBranch,
 	)
 
 	if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
@@ -318,6 +341,22 @@ func (p *PRProcessor) createConflictPR(targetBranch string, commitMessages []str
 
 	log.Printf("Added conflict comment to PR #%d for branch %s", pr.GetNumber(), targetBranch)
 	return nil
+}
+
+// extractCommitSHAsFromMessages extracts commit SHAs from formatted commit messages.
+// Messages are in format: "Message (abc1234)"
+func extractCommitSHAsFromMessages(messages []string) []string {
+	var shas []string
+	for _, msg := range messages {
+		// Find SHA in parentheses at the end
+		if idx := strings.LastIndex(msg, "("); idx != -1 {
+			if endIdx := strings.LastIndex(msg, ")"); endIdx > idx {
+				sha := msg[idx+1 : endIdx]
+				shas = append(shas, sha)
+			}
+		}
+	}
+	return shas
 }
 
 // getUserForPermissionCheck determines which user to check permissions for.

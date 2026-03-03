@@ -47,7 +47,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	if cfg.ConflictLabel == "" {
-		cfg.ConflictLabel = "cherry-pick-conflict"
+		cfg.ConflictLabel = "pronto-conflict"
 	}
 
 	if cfg.BotName == "" {

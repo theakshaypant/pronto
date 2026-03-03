@@ -112,27 +112,85 @@ func (c *Client) RemoveLabel(ctx context.Context, number int, label string) erro
 func FormatConflictPRBody(sourcePR int, targetBranch string, commits []string, conflictDetails string) string {
 	var sb strings.Builder
 
-	sb.WriteString("## Cherry-pick Conflict\n\n")
-	sb.WriteString(fmt.Sprintf("This PR was automatically created because cherry-picking PR #%d to `%s` resulted in conflicts.\n\n", sourcePR, targetBranch))
+	if conflictDetails != "" {
+		// Conflict PR
+		sb.WriteString("## 🔀 Cherry-pick Conflict\n\n")
+		sb.WriteString(fmt.Sprintf("This PR was automatically created because cherry-picking PR #%d to `%s` resulted in conflicts.\n\n", sourcePR, targetBranch))
+	} else {
+		// Fallback PR (no permissions or other reason)
+		sb.WriteString("## 🤖 Automated Cherry-pick\n\n")
+		sb.WriteString(fmt.Sprintf("This PR contains the cherry-picked commits from PR #%d to `%s`.\n\n", sourcePR, targetBranch))
+	}
 
-	sb.WriteString("### Original Commits\n\n")
+	sb.WriteString("### Original PR\n\n")
+	sb.WriteString(fmt.Sprintf("- Source: #%d\n", sourcePR))
+	sb.WriteString(fmt.Sprintf("- Target branch: `%s`\n\n", targetBranch))
+
+	sb.WriteString("### Commits\n\n")
 	for _, commit := range commits {
 		sb.WriteString(fmt.Sprintf("- %s\n", commit))
 	}
 
 	if conflictDetails != "" {
-		sb.WriteString("\n### Conflict Details\n\n")
+		sb.WriteString("\n### ⚠️ Conflict Details\n\n")
 		sb.WriteString("```\n")
 		sb.WriteString(conflictDetails)
 		sb.WriteString("\n```\n")
+
+		sb.WriteString("\n### 🛠️ How to Resolve Conflicts\n\n")
+		sb.WriteString("To resolve the conflicts locally, run the following commands:\n\n")
+		sb.WriteString("```bash\n")
+		sb.WriteString("# Checkout the target branch\n")
+		sb.WriteString(fmt.Sprintf("git checkout %s\n", targetBranch))
+		sb.WriteString("git pull origin " + targetBranch + "\n\n")
+
+		sb.WriteString("# Cherry-pick the commits\n")
+
+		// Extract commit SHAs from commit messages
+		commitSHAs := extractCommitSHAs(commits)
+		if len(commitSHAs) > 0 {
+			sb.WriteString("git cherry-pick")
+			for _, sha := range commitSHAs {
+				sb.WriteString(" " + sha)
+			}
+			sb.WriteString("\n\n")
+		}
+
+		sb.WriteString("# Resolve conflicts in the affected files\n")
+		sb.WriteString("# Edit the conflicted files, then:\n")
+		sb.WriteString("git add .\n")
+		sb.WriteString("git cherry-pick --continue\n\n")
+
+		sb.WriteString("# Push to this PR's branch\n")
+		sb.WriteString(fmt.Sprintf("git push origin %s\n", targetBranch))
+		sb.WriteString("```\n\n")
+
+		sb.WriteString("Alternatively, you can resolve conflicts directly in this PR by editing the files through GitHub's web interface.\n\n")
+	} else {
+		sb.WriteString("\n### Next Steps\n\n")
+		sb.WriteString("Review the changes and merge this PR if everything looks correct.\n\n")
 	}
 
-	sb.WriteString("\n### Next Steps\n\n")
-	sb.WriteString("Please resolve the conflicts manually and update this PR.\n\n")
 	sb.WriteString("---\n")
 	sb.WriteString("🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)\n")
 
 	return sb.String()
+}
+
+// extractCommitSHAs extracts commit SHAs from commit messages.
+// Commit messages are formatted as "Message (abc1234)"
+func extractCommitSHAs(commits []string) []string {
+	var shas []string
+	for _, commit := range commits {
+		// Find SHA in parentheses at the end: "Message (abc1234)"
+		if idx := strings.LastIndex(commit, "("); idx != -1 {
+			if endIdx := strings.LastIndex(commit, ")"); endIdx > idx {
+				sha := commit[idx+1 : endIdx]
+				shas = append(shas, sha)
+			}
+		}
+	}
+	return shas
 }
 
 // FormatMissingBranchComment generates a comment for when a target branch doesn't exist.

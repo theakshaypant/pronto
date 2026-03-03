@@ -14,6 +14,7 @@ import (
 	ghclient "github.com/theakshaypant/pronto/internal/github"
 	"github.com/theakshaypant/pronto/internal/git"
 	"github.com/theakshaypant/pronto/internal/permissions"
+	"github.com/theakshaypant/pronto/pkg/models"
 )
 
 // PRProcessor handles pull request events for cherry-picking.
@@ -114,10 +115,10 @@ func (p *PRProcessor) Process(action EventAction) error {
 
 	// Process each target branch
 	for _, targetBranch := range targetBranches {
-		log.Printf("Processing target branch: %s", targetBranch)
+		log.Printf("Processing target branch: %s", targetBranch.Name)
 
 		if err := p.processTargetBranch(targetBranch, commitSHAs, commitMessages, hasWriteAccess); err != nil {
-			log.Printf("Error processing branch %s: %v", targetBranch, err)
+			log.Printf("Error processing branch %s: %v", targetBranch.Name, err)
 			// Continue with other branches even if one fails
 		}
 	}
@@ -126,8 +127,9 @@ func (p *PRProcessor) Process(action EventAction) error {
 }
 
 // processTargetBranch handles cherry-picking to a single target branch.
-func (p *PRProcessor) processTargetBranch(targetBranch string, commitSHAs, commitMessages []string, hasWriteAccess bool) error {
+func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHAs, commitMessages []string, hasWriteAccess bool) error {
 	pr := p.event.PullRequest
+	targetBranch := target.Name
 
 	// Check if target branch exists
 	exists, err := p.ghClient.BranchExists(p.ctx, targetBranch)
@@ -135,7 +137,55 @@ func (p *PRProcessor) processTargetBranch(targetBranch string, commitSHAs, commi
 		return fmt.Errorf("failed to check if branch exists: %w", err)
 	}
 
-	if !exists {
+	// Handle branch creation if specified with .. notation
+	if !exists && target.ShouldCreate {
+		log.Printf("Branch %s does not exist, creating from %s", targetBranch, target.BaseBranch)
+
+		// Verify base branch exists
+		baseExists, err := p.ghClient.BranchExists(p.ctx, target.BaseBranch)
+		if err != nil {
+			return fmt.Errorf("failed to check if base branch exists: %w", err)
+		}
+
+		if !baseExists {
+			comment := fmt.Sprintf(
+				"⚠️ **PROnto Notice**: Cannot create branch `%s` because the base branch `%s` does not exist.\n\n"+
+					"Please check the label format or create the base branch first.\n\n"+
+					"---\n"+
+					"🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)",
+				targetBranch,
+				target.BaseBranch,
+			)
+			if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
+				log.Printf("Failed to add missing base branch comment: %v", err)
+			}
+			return nil
+		}
+
+		// Get base branch SHA
+		baseSHA, err := p.ghClient.GetBranchSHA(p.ctx, target.BaseBranch)
+		if err != nil {
+			return fmt.Errorf("failed to get base branch SHA: %w", err)
+		}
+
+		// Create the target branch
+		if err := p.ghClient.CreateBranch(p.ctx, targetBranch, baseSHA); err != nil {
+			return fmt.Errorf("failed to create target branch: %w", err)
+		}
+
+		log.Printf("Successfully created branch %s from %s", targetBranch, target.BaseBranch)
+
+		// Add comment about branch creation
+		comment := fmt.Sprintf(
+			"✅ **PROnto**: Created branch `%s` from `%s` and will now cherry-pick commits.",
+			targetBranch,
+			target.BaseBranch,
+		)
+		if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {
+			log.Printf("Failed to add branch creation comment: %v", err)
+		}
+	} else if !exists {
+		// Branch doesn't exist and no .. notation specified
 		log.Printf("Branch %s does not exist, adding comment to PR", targetBranch)
 		comment := ghclient.FormatMissingBranchComment(targetBranch, p.config.LabelPattern)
 		if err := p.ghClient.AddComment(p.ctx, pr.GetNumber(), comment); err != nil {

@@ -67,8 +67,8 @@ func run() error {
 		return fmt.Errorf("failed to create PR processor: %w", err)
 	}
 
-	// Process the pull request event
-	if err := processor.Process(eventAction); err != nil {
+	// Process the pull request event with panic recovery
+	if err := processor.SafeProcess(eventAction); err != nil {
 		return fmt.Errorf("failed to process pull request: %w", err)
 	}
 

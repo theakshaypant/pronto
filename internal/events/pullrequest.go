@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/go-github/v81/github"
 	"github.com/theakshaypant/pronto/internal/action"
@@ -27,8 +28,9 @@ type PRProcessor struct {
 
 // NewPRProcessor creates a new pull request processor.
 func NewPRProcessor(ctx context.Context, cfg *action.Config, event *github.PullRequestEvent) (*PRProcessor, error) {
-	if event.Repo == nil {
-		return nil, fmt.Errorf("event repository is nil")
+	// Perform comprehensive validation
+	if err := validatePREvent(event); err != nil {
+		return nil, fmt.Errorf("invalid pull request event: %w", err)
 	}
 
 	owner := event.Repo.GetOwner().GetLogin()
@@ -94,6 +96,11 @@ func (p *PRProcessor) Process(action EventAction) error {
 	commits, err := p.ghClient.GetPullRequestCommits(p.ctx, pr.GetNumber())
 	if err != nil {
 		return fmt.Errorf("failed to get PR commits: %w", err)
+	}
+
+	// Validate commits
+	if err := validateCommits(commits); err != nil {
+		return fmt.Errorf("invalid commits in PR: %w", err)
 	}
 
 	commitSHAs := make([]string, len(commits))
@@ -338,9 +345,11 @@ func (p *PRProcessor) getUserForPermissionCheck(action EventAction) string {
 
 // formatCommitList formats commit messages as a bulleted list.
 func formatCommitList(messages []string) string {
-	result := ""
+	var sb strings.Builder
 	for _, msg := range messages {
-		result += fmt.Sprintf("- %s\n", msg)
+		sb.WriteString("- ")
+		sb.WriteString(msg)
+		sb.WriteString("\n")
 	}
-	return result
+	return sb.String()
 }

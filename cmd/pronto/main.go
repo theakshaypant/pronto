@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/google/go-github/v81/github"
 	"github.com/theakshaypant/pronto/internal/action"
 	"github.com/theakshaypant/pronto/internal/events"
 )
@@ -43,7 +44,7 @@ func run() error {
 
 	// Parse the GitHub event
 	log.Println("Parsing GitHub event...")
-	prEvent, eventType, eventAction, err := handler.ParseEvent(ctx)
+	event, eventType, eventAction, err := handler.ParseEvent(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to parse event: %w", err)
 	}
@@ -52,6 +53,27 @@ func run() error {
 	if !handler.ShouldProcess(eventType, eventAction) {
 		log.Printf("Event type '%s' with action '%s' does not require processing, skipping", eventType, eventAction)
 		return nil
+	}
+
+	// Route to appropriate processor based on event type
+	switch eventType {
+	case events.EventTypePullRequest:
+		return processPullRequest(ctx, handler, cfg, event, eventAction)
+
+	case events.EventTypeIssues:
+		return processIssue(ctx, handler, cfg, event, eventAction)
+
+	default:
+		return fmt.Errorf("unsupported event type: %s", eventType)
+	}
+}
+
+// processPullRequest handles pull request events.
+func processPullRequest(ctx context.Context, handler *events.Handler, cfg *action.Config, event interface{}, eventAction events.EventAction) error {
+	// Type assert to pull request event
+	prEvent, ok := event.(*github.PullRequestEvent)
+	if !ok {
+		return fmt.Errorf("invalid pull request event type")
 	}
 
 	// Validate event
@@ -70,6 +92,35 @@ func run() error {
 	// Process the pull request event with panic recovery
 	if err := processor.SafeProcess(eventAction); err != nil {
 		return fmt.Errorf("failed to process pull request: %w", err)
+	}
+
+	return nil
+}
+
+// processIssue handles issue events.
+func processIssue(ctx context.Context, handler *events.Handler, cfg *action.Config, event interface{}, eventAction events.EventAction) error {
+	// Type assert to issues event
+	issueEvent, ok := event.(*github.IssuesEvent)
+	if !ok {
+		return fmt.Errorf("invalid issues event type")
+	}
+
+	// Validate event
+	if err := handler.ValidateIssueEvent(issueEvent); err != nil {
+		return fmt.Errorf("invalid event: %w", err)
+	}
+
+	log.Printf("Processing issue #%d (action: %s)", *issueEvent.Issue.Number, eventAction)
+
+	// Create issue processor
+	processor, err := events.NewIssueProcessor(ctx, cfg, issueEvent)
+	if err != nil {
+		return fmt.Errorf("failed to create issue processor: %w", err)
+	}
+
+	// Process the issue event with panic recovery
+	if err := processor.SafeProcess(eventAction); err != nil {
+		return fmt.Errorf("failed to process issue: %w", err)
 	}
 
 	return nil

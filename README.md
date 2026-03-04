@@ -60,13 +60,13 @@ This creates `release-2.0` from `main`, then cherry-picks your commits.
 ```
 pronto/release-1.0?tag=v1.0.1
 ```
-Cherry-picks to `release-1.0` and creates an annotated tag `v1.0.1`.
+Cherry-picks to `release-1.0`. If `always_create_pr: false`, the tag `v1.0.1` is created automatically. If `always_create_pr: true` (default), the PR includes instructions for creating the tag after merge.
 
 **Create branch, cherry-pick, and tag:**
 ```
 pronto/release-2.0..main?tag=v2.0.0
 ```
-Creates `release-2.0` from `main`, cherry-picks commits, and creates tag `v2.0.0`.
+Creates `release-2.0` from `main`, cherry-picks commits. Tag creation depends on the `always_create_pr` setting (see above).
 
 **Multiple branches:**
 Add multiple labels:
@@ -88,15 +88,19 @@ All inputs are optional except `github_token`.
     conflict_label: 'pronto-conflict'  # default
     bot_name: 'PROnto Bot'             # default
     bot_email: 'pronto[bot]@users.noreply.github.com'
+    always_create_pr: 'true'           # default
 ```
 
 ## What happens when...
 
-**You have write access:**
-Commits are pushed directly to the target branch. If you specified a tag with `?tag=`, it's created and pushed too. A success comment is added to the PR.
+**By default (always_create_pr: 'true'):**
+A pull request is created with the cherry-picked commits for review, even if you have write access. This enforces code review on cherry-picks. If you specified a tag with `?tag=`, the PR body will include instructions for creating the tag after merging.
+
+**You want to push directly:**
+Set `always_create_pr: 'false'` if you have write access and want commits pushed directly to the target branch. If you specified a tag with `?tag=`, it's created and pushed automatically. A success comment is added to the PR.
 
 **You don't have write access:**
-A fallback PR is created with the cherry-picked commits. Someone with permissions can review and merge it.
+A pull request is created with the cherry-picked commits. Someone with permissions can review and merge it. If a tag was specified, instructions for creating it after merge are included in the PR body.
 
 **There's a conflict:**
 A comment is added with the exact git commands to resolve it manually, including the commit SHAs.
@@ -106,7 +110,8 @@ If you used `pronto/branch-name` (without `..`), you'll get a comment saying the
 If you used `pronto/branch-name..base`, we create the branch from `base` first.
 
 **You specify a tag:**
-After a successful cherry-pick, PROnto creates an annotated Git tag with metadata (PR number, branch, commit count) and pushes it to the remote.
+- If `always_create_pr: false` and you have write access: PROnto creates an annotated Git tag with metadata (PR number, branch, commit count) and pushes it automatically.
+- If `always_create_pr: true` (default) or you lack write access: The created PR includes a "Tag Creation Required" section with the exact commands to create the tag after merging.
 
 ## Troubleshooting
 

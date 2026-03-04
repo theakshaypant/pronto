@@ -25,6 +25,10 @@ inputs:
     description: 'Git committer email for cherry-pick commits'
     required: false
     default: 'pronto[bot]@users.noreply.github.com'
+  always_create_pr:
+    description: 'Always create a pull request instead of pushing directly, even if user has write permissions'
+    required: false
+    default: 'true'
 
 runs:
   using: 'docker'

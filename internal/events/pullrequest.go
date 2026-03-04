@@ -298,8 +298,8 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *m
 	pr := p.event.PullRequest
 	targetBranch := target.Name
 
-	if hasWriteAccess {
-		// User has write access - push directly
+	if hasWriteAccess && !p.config.AlwaysCreatePR {
+		// User has write access and always_create_pr is not enabled - push directly
 		log.Printf("Pushing cherry-picked commits to %s", targetBranch)
 		if err := repo.Push("origin", targetBranch, false); err != nil {
 			return ProcessResult{
@@ -357,9 +357,13 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *m
 		}
 	}
 
-	// User lacks write access - create fallback PR
-	log.Printf("User lacks write access, creating fallback PR")
-	return p.createFallbackPR(repo, targetBranch, commitMessages, "", pr.GetNumber())
+	// Create PR (either user lacks write access or always_create_pr is enabled)
+	reason := "user lacks write access"
+	if p.config.AlwaysCreatePR {
+		reason = "always_create_pr is enabled"
+	}
+	log.Printf("Creating PR (%s)", reason)
+	return p.createFallbackPR(repo, target, commitMessages, "", pr.GetNumber())
 }
 
 // handleConflictedCherryPick handles a cherry-pick with conflicts.
@@ -403,7 +407,8 @@ func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBra
 }
 
 // createFallbackPR creates a PR for users without write access.
-func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string, commitMessages []string, conflictDetails string, prNumber int) ProcessResult {
+func (p *PRProcessor) createFallbackPR(repo *git.Repository, target *models.TargetBranch, commitMessages []string, conflictDetails string, prNumber int) ProcessResult {
+	targetBranch := target.Name
 	// Create a new branch for the fallback PR
 	branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch, prNumber)
 
@@ -427,7 +432,7 @@ func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string
 	}
 
 	// Create PR
-	prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch, commitMessages, conflictDetails)
+	prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch, commitMessages, conflictDetails, target.TagName)
 	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", prNumber, targetBranch)
 
 	// Always add "pronto" label to identify auto-created PRs
@@ -453,10 +458,19 @@ func (p *PRProcessor) createFallbackPR(repo *git.Repository, targetBranch string
 
 	log.Printf("Created fallback PR #%d", newPR.GetNumber())
 
+	// Build success message
+	msg := fmt.Sprintf("✅ Created PR #%d", newPR.GetNumber())
+	if target.ShouldCreate {
+		msg = fmt.Sprintf("✅ Created branch from `%s` and created PR #%d", target.BaseBranch, newPR.GetNumber())
+	}
+	if target.TagName != "" {
+		msg += fmt.Sprintf(" (tag `%s` pending merge)", target.TagName)
+	}
+
 	return ProcessResult{
 		TargetBranch: targetBranch,
 		Success:      true,
-		Message:      fmt.Sprintf("✅ Created PR #%d (no write access)", newPR.GetNumber()),
+		Message:      msg,
 		CreatedPR:    newPR.GetNumber(),
 	}
 }

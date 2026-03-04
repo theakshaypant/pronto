@@ -29,3 +29,5 @@ jobs:
           # bot_name: 'PROnto Bot'
           # Optional: customize bot email
           # bot_email: 'bot@example.com'
+          # Optional: always create a PR instead of pushing directly, even if user has write permissions (default: true)
+          # always_create_pr: 'true'

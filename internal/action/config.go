@@ -23,17 +23,21 @@ type Config struct {
 
 	// BotEmail is the git committer email for cherry-pick commits
 	BotEmail string
+
+	// AlwaysCreatePR forces creation of a PR instead of pushing directly, even if user has write permissions
+	AlwaysCreatePR bool
 }
 
 // LoadConfig reads and validates configuration from GitHub Action inputs.
 // GitHub Actions expose inputs as environment variables with the pattern INPUT_<NAME>.
 func LoadConfig() (*Config, error) {
 	cfg := &Config{
-		GitHubToken:   getInput("github_token"),
-		LabelPattern:  getInput("label_pattern"),
-		ConflictLabel: getInput("conflict_label"),
-		BotName:       getInput("bot_name"),
-		BotEmail:      getInput("bot_email"),
+		GitHubToken:    getInput("github_token"),
+		LabelPattern:   getInput("label_pattern"),
+		ConflictLabel:  getInput("conflict_label"),
+		BotName:        getInput("bot_name"),
+		BotEmail:       getInput("bot_email"),
+		AlwaysCreatePR: getInputBool("always_create_pr"),
 	}
 
 	// Validate required fields
@@ -90,4 +94,11 @@ func getInput(name string) string {
 	// "github_token" -> "INPUT_GITHUB_TOKEN"
 	envName := "INPUT_" + strings.ToUpper(name)
 	return os.Getenv(envName)
+}
+
+// getInputBool retrieves a boolean GitHub Action input from environment variables.
+// Returns true if the value is "true" (case-insensitive), false otherwise.
+func getInputBool(name string) bool {
+	value := getInput(name)
+	return strings.ToLower(strings.TrimSpace(value)) == "true"
 }

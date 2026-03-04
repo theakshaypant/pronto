@@ -109,7 +109,7 @@ func (c *Client) RemoveLabel(ctx context.Context, number int, label string) erro
 }
 
 // FormatConflictPRBody generates the body text for a conflict PR.
-func FormatConflictPRBody(sourcePR int, targetBranch string, commits []string, conflictDetails string) string {
+func FormatConflictPRBody(sourcePR int, targetBranch string, commits []string, conflictDetails string, tagName string) string {
 	var sb strings.Builder
 
 	if conflictDetails != "" {
@@ -169,6 +169,18 @@ func FormatConflictPRBody(sourcePR int, targetBranch string, commits []string, c
 	} else {
 		sb.WriteString("\n### Next Steps\n\n")
 		sb.WriteString("Review the changes and merge this PR if everything looks correct.\n\n")
+	}
+
+	// Add tag creation instructions if a tag is specified
+	if tagName != "" {
+		sb.WriteString("### 🏷️ Tag Creation Required\n\n")
+		sb.WriteString(fmt.Sprintf("After merging this PR, create the tag `%s` by running:\n\n", tagName))
+		sb.WriteString("```bash\n")
+		sb.WriteString(fmt.Sprintf("git checkout %s\n", targetBranch))
+		sb.WriteString(fmt.Sprintf("git pull origin %s\n", targetBranch))
+		sb.WriteString(fmt.Sprintf("git tag -a %s -m \"Cherry-picked PR #%d to %s\"\n", tagName, sourcePR, targetBranch))
+		sb.WriteString(fmt.Sprintf("git push origin %s\n", tagName))
+		sb.WriteString("```\n\n")
 	}
 
 	sb.WriteString("---\n")

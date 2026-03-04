@@ -26,10 +26,6 @@ func ParsePRNumbers(text string) []int {
 	var prNumbers []int
 
 	for _, match := range matches {
-		if len(match) < 2 {
-			continue
-		}
-
 		// Convert string to int
 		prNum, err := strconv.Atoi(match[1])
 		if err != nil {

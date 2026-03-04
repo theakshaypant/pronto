@@ -117,7 +117,7 @@ func FormatConflictPRBody(sourcePR int, targetBranch string, commits []string, c
 		sb.WriteString("## 🔀 Cherry-pick Conflict\n\n")
 		sb.WriteString(fmt.Sprintf("This PR was automatically created because cherry-picking PR #%d to `%s` resulted in conflicts.\n\n", sourcePR, targetBranch))
 	} else {
-		// Fallback PR (no permissions or other reason)
+		// Cherry-pick PR
 		sb.WriteString("## 🤖 Automated Cherry-pick\n\n")
 		sb.WriteString(fmt.Sprintf("This PR contains the cherry-picked commits from PR #%d to `%s`.\n\n", sourcePR, targetBranch))
 	}
@@ -222,7 +222,7 @@ func FormatMissingBranchComment(branchName, labelPattern string) string {
 func FormatNoPermissionComment(username, targetBranch string) string {
 	return fmt.Sprintf(
 		"⚠️ **PROnto Notice**: User @%s does not have write permissions to this repository.\n\n"+
-			"A fallback pull request will be created for cherry-picking to `%s` instead of automatically pushing changes.\n\n"+
+			"A cherry-pick pull request will be created for cherry-picking to `%s` instead of automatically pushing changes.\n\n"+
 			"---\n"+
 			"🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)",
 		username,

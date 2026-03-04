@@ -363,7 +363,7 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *m
 		reason = "always_create_pr is enabled"
 	}
 	log.Printf("Creating PR (%s)", reason)
-	return p.createFallbackPR(repo, target, commitMessages, "", pr.GetNumber())
+	return p.createCherryPickPR(repo, target, commitMessages, "", pr.GetNumber())
 }
 
 // handleConflictedCherryPick handles a cherry-pick with conflicts.
@@ -406,28 +406,28 @@ func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBra
 	}
 }
 
-// createFallbackPR creates a PR for users without write access.
-func (p *PRProcessor) createFallbackPR(repo *git.Repository, target *models.TargetBranch, commitMessages []string, conflictDetails string, prNumber int) ProcessResult {
+// createCherryPickPR creates a PR for cherry-picked changes.
+func (p *PRProcessor) createCherryPickPR(repo *git.Repository, target *models.TargetBranch, commitMessages []string, conflictDetails string, prNumber int) ProcessResult {
 	targetBranch := target.Name
-	// Create a new branch for the fallback PR
+	// Create a new branch for the cherry-pick PR
 	branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch, prNumber)
 
-	log.Printf("Creating fallback branch: %s", branchName)
+	log.Printf("Creating cherry-pick branch: %s", branchName)
 	if err := repo.CreateBranch(branchName); err != nil {
 		return ProcessResult{
 			TargetBranch: targetBranch,
 			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create fallback branch: %v", err),
+			Message:      fmt.Sprintf("❌ Failed to create cherry-pick branch: %v", err),
 		}
 	}
 
 	// Push the branch
-	log.Printf("Pushing fallback branch to origin")
+	log.Printf("Pushing cherry-pick branch to origin")
 	if err := repo.Push("origin", branchName, false); err != nil {
 		return ProcessResult{
 			TargetBranch: targetBranch,
 			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to push fallback branch: %v", err),
+			Message:      fmt.Sprintf("❌ Failed to push cherry-pick branch: %v", err),
 		}
 	}
 
@@ -452,11 +452,11 @@ func (p *PRProcessor) createFallbackPR(repo *git.Repository, target *models.Targ
 		return ProcessResult{
 			TargetBranch: targetBranch,
 			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create fallback PR: %v", err),
+			Message:      fmt.Sprintf("❌ Failed to create cherry-pick PR: %v", err),
 		}
 	}
 
-	log.Printf("Created fallback PR #%d", newPR.GetNumber())
+	log.Printf("Created cherry-pick PR #%d", newPR.GetNumber())
 
 	// Build success message
 	msg := fmt.Sprintf("✅ Created PR #%d", newPR.GetNumber())

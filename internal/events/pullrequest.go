@@ -11,8 +11,8 @@ import (
 	"github.com/google/go-github/v81/github"
 	"github.com/theakshaypant/pronto/internal/action"
 	"github.com/theakshaypant/pronto/internal/deduplication"
-	ghclient "github.com/theakshaypant/pronto/internal/github"
 	"github.com/theakshaypant/pronto/internal/git"
+	ghclient "github.com/theakshaypant/pronto/internal/github"
 	"github.com/theakshaypant/pronto/internal/permissions"
 	"github.com/theakshaypant/pronto/pkg/models"
 )
@@ -82,12 +82,31 @@ func (p *PRProcessor) Process(action EventAction) error {
 	// Parse pronto/* labels to get target branches
 	targetBranches := ghclient.ParseTargetBranches(pr.Labels, p.config.LabelPattern)
 
+	// If no labels on PR, check for tracking issues that reference this PR
 	if len(targetBranches) == 0 {
-		log.Printf("No pronto labels found on PR #%d, skipping", pr.GetNumber())
+		log.Printf("No pronto labels found on PR #%d, checking for tracking issues", pr.GetNumber())
+
+		trackingIssues, err := FindTrackingIssues(p.ctx, p.ghClient, pr.GetNumber(), p.config.LabelPattern)
+		if err != nil {
+			log.Printf("Error finding tracking issues: %v", err)
+		} else if len(trackingIssues) > 0 {
+			log.Printf("Found %d tracking issue(s) that reference this PR", len(trackingIssues))
+
+			// Process cherry-picks for each tracking issue
+			for _, issue := range trackingIssues {
+				if err := p.processTrackingIssue(issue, pr.GetNumber()); err != nil {
+					log.Printf("Error processing tracking issue #%d: %v", issue.Number, err)
+				}
+			}
+
+			return nil
+		}
+
+		log.Printf("No tracking issues found for PR #%d, skipping", pr.GetNumber())
 		return nil
 	}
 
-	log.Printf("Found %d target branch(es): %v", len(targetBranches), targetBranches)
+	log.Printf("Found %d target branch(es) from PR labels: %v", len(targetBranches), targetBranches)
 
 	// Get the user who triggered the action
 	username := p.getUserForPermissionCheck(action)
@@ -295,7 +314,7 @@ func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHA
 		return p.handleSuccessfulCherryPick(repo, target, commitMessages, hasWriteAccess)
 	}
 
-	return p.handleConflictedCherryPick(repo, targetBranch, commitMessages, result)
+	return p.handleConflictedCherryPick(repo, targetBranch, commitMessages, result, pr.GetNumber(), target.TagName)
 }
 
 // handleSuccessfulCherryPick handles a successful cherry-pick.
@@ -310,7 +329,7 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *m
 			return ProcessResult{
 				TargetBranch: targetBranch,
 				Success:      false,
-				Message:      fmt.Sprintf("❌ Failed to push to target branch: %v", err),
+				Message:      fmt.Sprintf("❌ Failed to push to target branch: %s", git.SanitizeError(err)),
 			}
 		}
 
@@ -335,11 +354,11 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *m
 
 			// Push the tag
 			if err := repo.PushTag("origin", target.TagName); err != nil {
-				log.Printf("Failed to push tag %s: %v", target.TagName, err)
+				log.Printf("Failed to push tag %s: %v", target.TagName, git.SanitizeError(err))
 				return ProcessResult{
 					TargetBranch: targetBranch,
 					Success:      false,
-					Message:      fmt.Sprintf("❌ Cherry-pick and tag creation succeeded but tag push failed: %v", err),
+					Message:      fmt.Sprintf("❌ Cherry-pick and tag creation succeeded but tag push failed: %s", git.SanitizeError(err)),
 				}
 			}
 
@@ -372,42 +391,101 @@ func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *m
 }
 
 // handleConflictedCherryPick handles a cherry-pick with conflicts.
-func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, result *git.CherryPickResult) ProcessResult {
+func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, result *git.CherryPickResult, prNumber int, tagName string) ProcessResult {
 	log.Printf("Cherry-pick resulted in conflicts for branch %s", targetBranch)
 
-	// Get conflict details
+	// Get conflict details while we still have the conflicts in working tree
 	details, err := repo.GetConflictDetails()
 	if err != nil {
 		log.Printf("Failed to get conflict details: %v", err)
 		details = fmt.Sprintf("Conflicts in %d file(s)", len(result.ConflictedFiles))
 	}
 
-	// Extract commit SHAs for the instructions
-	cherryPickSHAs := extractCommitSHAsFromMessages(commitMessages)
-	cherryPickCmd := "git cherry-pick " + strings.Join(cherryPickSHAs, " ")
+	// Stage all files (including conflicts with markers)
+	// This must be done while still in the conflicted cherry-pick state
+	if err := repo.StageAll(); err != nil {
+		// Abort cherry-pick before returning
+		repo.AbortCherryPick()
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to stage conflicted files: %v", err),
+		}
+	}
 
-	msg := fmt.Sprintf("⚠️ Cherry-pick resulted in conflicts. Manual resolution required.\n\n"+
-		"**Conflict Details:**\n```\n%s\n```\n\n"+
-		"**Commands to resolve:**\n```bash\n"+
-		"git checkout %s\n"+
-		"git pull origin %s\n"+
-		"%s\n"+
-		"# Resolve conflicts, then:\n"+
-		"git add .\n"+
-		"git cherry-pick --continue\n"+
-		"git push origin %s\n"+
-		"```",
-		details,
-		targetBranch,
-		targetBranch,
-		cherryPickCmd,
-		targetBranch,
-	)
+	// Commit the conflicts to complete the cherry-pick
+	// This creates a commit with conflict markers that can be resolved later
+	commitMsg := fmt.Sprintf("Cherry-pick PR #%d to %s (conflicts)\n\nConflicts need manual resolution", prNumber, targetBranch)
+	if err := repo.Commit(commitMsg); err != nil {
+		// Abort cherry-pick before returning
+		repo.AbortCherryPick()
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to commit conflicts: %v", err),
+		}
+	}
+
+	// Now create a new branch from this commit
+	conflictBranch := fmt.Sprintf("pronto/%s/pr-%d-conflicts", targetBranch, prNumber)
+	log.Printf("Creating conflict branch: %s", conflictBranch)
+
+	if err := repo.CreateBranch(conflictBranch); err != nil {
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to create conflict branch: %v", err),
+		}
+	}
+
+	// Push the conflict branch (force push in case it exists from a previous attempt)
+	log.Printf("Pushing conflict branch to origin (force)")
+	if err := repo.Push("origin", conflictBranch, true); err != nil {
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to push conflict branch: %s", git.SanitizeError(err)),
+		}
+	}
+
+	// Checkout back to the base branch and reset it to remove the conflict commit
+	// We want the base branch clean, with only the conflict branch having the markers
+	if err := repo.Checkout(targetBranch); err != nil {
+		log.Printf("Warning: Failed to checkout back to %s: %v", targetBranch, err)
+	} else {
+		// Reset to HEAD~1 to remove the conflict commit we just created
+		if err := repo.ResetHard("HEAD~1"); err != nil {
+			log.Printf("Warning: Failed to reset %s: %v", targetBranch, err)
+		}
+	}
+
+	// Create PR with conflict label
+	prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch, commitMessages, details, tagName)
+	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s (CONFLICTS)", prNumber, targetBranch)
+
+	labels := []string{"pronto", p.config.ConflictLabel}
+
+	newPR, err := p.ghClient.CreatePullRequest(p.ctx, ghclient.PROptions{
+		Title:  prTitle,
+		Body:   prBody,
+		Head:   conflictBranch,
+		Base:   targetBranch,
+		Labels: labels,
+	})
+	if err != nil {
+		return ProcessResult{
+			TargetBranch: targetBranch,
+			Success:      false,
+			Message:      fmt.Sprintf("❌ Failed to create conflict PR: %v", err),
+		}
+	}
+
+	log.Printf("Created conflict PR #%d", newPR.GetNumber())
 
 	return ProcessResult{
 		TargetBranch: targetBranch,
 		Success:      false,
-		Message:      msg,
+		Message:      fmt.Sprintf("⚠️ Conflicts detected - created PR #%d for manual resolution", newPR.GetNumber()),
 	}
 }
 
@@ -432,7 +510,7 @@ func (p *PRProcessor) createCherryPickPR(repo *git.Repository, target *models.Ta
 		return ProcessResult{
 			TargetBranch: targetBranch,
 			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to push cherry-pick branch: %v", err),
+			Message:      fmt.Sprintf("❌ Failed to push cherry-pick branch: %s", git.SanitizeError(err)),
 		}
 	}
 
@@ -522,22 +600,6 @@ func (p *PRProcessor) createSummaryComment(results []ProcessResult) error {
 
 	log.Printf("Added summary comment to PR #%d with %d results", pr.GetNumber(), len(results))
 	return nil
-}
-
-// extractCommitSHAsFromMessages extracts commit SHAs from formatted commit messages.
-// Messages are in format: "Message (abc1234)"
-func extractCommitSHAsFromMessages(messages []string) []string {
-	var shas []string
-	for _, msg := range messages {
-		// Find SHA in parentheses at the end
-		if idx := strings.LastIndex(msg, "("); idx != -1 {
-			if endIdx := strings.LastIndex(msg, ")"); endIdx > idx {
-				sha := msg[idx+1 : endIdx]
-				shas = append(shas, sha)
-			}
-		}
-	}
-	return shas
 }
 
 // updateTrackingIssues updates tracking issues when a cherry-pick PR merges.
@@ -639,6 +701,374 @@ func parseCherryPickBranchName(branchName string) (prNumber int, targetBranch st
 	return prNumber, targetBranch, nil
 }
 
+// processTrackingIssue processes cherry-picks for a PR when it's referenced in a tracking issue.
+func (p *PRProcessor) processTrackingIssue(trackingIssue *TrackingIssue, prNumber int) error {
+	log.Printf("Processing tracking issue #%d for PR #%d", trackingIssue.Number, prNumber)
+
+	// Get target branches from issue labels
+	targetBranches := ghclient.ParseTargetBranches(trackingIssue.Issue.Labels, p.config.LabelPattern)
+	if len(targetBranches) == 0 {
+		log.Printf("No pronto labels found on tracking issue #%d", trackingIssue.Number)
+		return nil
+	}
+
+	log.Printf("Found %d target branch(es) from tracking issue: %v", len(targetBranches), targetBranches)
+
+	// Get the PR
+	pr, err := p.ghClient.GetPullRequest(p.ctx, prNumber)
+	if err != nil {
+		return fmt.Errorf("failed to get PR #%d: %w", prNumber, err)
+	}
+
+	// Get commits from the PR
+	commits, err := p.ghClient.GetPullRequestCommits(p.ctx, prNumber)
+	if err != nil {
+		return fmt.Errorf("failed to get PR commits: %w", err)
+	}
+
+	// Validate commits
+	if err := validateCommits(commits); err != nil {
+		return fmt.Errorf("invalid commits in PR: %w", err)
+	}
+
+	commitSHAs := make([]string, len(commits))
+	commitMessages := make([]string, len(commits))
+	for i, commit := range commits {
+		commitSHAs[i] = commit.GetSHA()
+		commitMessages[i] = fmt.Sprintf("%s (%s)", commit.Commit.GetMessage(), commit.GetSHA()[:7])
+	}
+
+	log.Printf("PR #%d has %d commit(s)", prNumber, len(commitSHAs))
+
+	// Check permissions
+	username := p.getUserForPermissionCheck(EventActionClosed)
+	hasWriteAccess, err := p.permChecker.HasWriteAccess(p.ctx, username)
+	if err != nil {
+		log.Printf("Failed to check permissions for user %s: %v", username, err)
+		hasWriteAccess = false
+	}
+
+	// Process each target branch
+	var results []BatchResult
+	for _, targetBranch := range targetBranches {
+		log.Printf("Processing target branch: %s for PR #%d", targetBranch.Name, prNumber)
+
+		result := BatchResult{
+			PRNumber:     prNumber,
+			TargetBranch: targetBranch.Name,
+		}
+
+		// Check deduplication
+		if p.tracker.IsProcessed(prNumber, targetBranch.Name, pr.GetHead().GetSHA()) {
+			log.Printf("Skipping duplicate processing for PR #%d to %s", prNumber, targetBranch.Name)
+			result.Success = false
+			result.Status = "skipped"
+			result.Message = "Already processed (duplicate)"
+			results = append(results, result)
+			continue
+		}
+
+		// Mark as processed
+		p.tracker.MarkProcessed(prNumber, targetBranch.Name, pr.GetHead().GetSHA())
+
+		// Create temporary directory for git operations
+		tempDir, err := os.MkdirTemp("", "pronto-*")
+		if err != nil {
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to create temp directory: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		repoDir := filepath.Join(tempDir, "repo")
+
+		// Clone repository
+		log.Printf("Cloning repository to %s", repoDir)
+		repo, err := git.Clone(git.CloneOptions{
+			URL:       p.event.Repo.GetCloneURL(),
+			Token:     p.config.GitHubToken,
+			Directory: repoDir,
+			Depth:     0, // Full clone needed for cherry-pick
+		})
+		if err != nil {
+			os.RemoveAll(tempDir)
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to clone repository: %v", git.SanitizeError(err))
+			results = append(results, result)
+			continue
+		}
+
+		// Configure git user
+		if err := repo.ConfigUser(p.config.BotName, p.config.BotEmail); err != nil {
+			os.RemoveAll(tempDir)
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to configure git: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		// Check if target branch exists
+		branchExists, err := p.ghClient.BranchExists(p.ctx, targetBranch.Name)
+		if err != nil {
+			os.RemoveAll(tempDir)
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to check branch existence: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		if !branchExists {
+			os.RemoveAll(tempDir)
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Target branch '%s' does not exist", targetBranch.Name)
+			results = append(results, result)
+			continue
+		}
+
+		// Checkout target branch
+		if err := repo.Checkout(targetBranch.Name); err != nil {
+			os.RemoveAll(tempDir)
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to checkout branch: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		// Perform cherry-pick
+		cherryPickResult, err := repo.CherryPick(commitSHAs...)
+		if err != nil {
+			os.RemoveAll(tempDir)
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Cherry-pick failed: %v", err)
+			results = append(results, result)
+			continue
+		}
+
+		if !cherryPickResult.Success {
+			os.RemoveAll(tempDir)
+			// Conflicts - for now just report
+			result.Success = false
+			result.Status = "conflict"
+			result.Message = fmt.Sprintf("Conflicts in %d file(s) - manual cherry-pick needed", len(cherryPickResult.ConflictedFiles))
+			results = append(results, result)
+			continue
+		}
+
+		// Push changes or create PR
+		if hasWriteAccess && !p.config.AlwaysCreatePR {
+			// Push directly
+			if err := repo.Push("origin", targetBranch.Name, false); err != nil {
+				os.RemoveAll(tempDir)
+				result.Success = false
+				result.Status = "failed"
+				result.Message = fmt.Sprintf("Failed to push: %s", git.SanitizeError(err))
+				results = append(results, result)
+				continue
+			}
+
+			result.Success = true
+			result.Status = "success"
+			result.Message = fmt.Sprintf("Cherry-picked %d commit(s)", len(commitMessages))
+		} else {
+			// Create PR
+			branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch.Name, prNumber)
+			if err := repo.CreateBranch(branchName); err != nil {
+				os.RemoveAll(tempDir)
+				result.Success = false
+				result.Status = "failed"
+				result.Message = fmt.Sprintf("Failed to create branch: %v", err)
+				results = append(results, result)
+				continue
+			}
+
+			if err := repo.Push("origin", branchName, false); err != nil {
+				os.RemoveAll(tempDir)
+				result.Success = false
+				result.Status = "failed"
+				result.Message = fmt.Sprintf("Failed to push: %s", git.SanitizeError(err))
+				results = append(results, result)
+				continue
+			}
+
+			// Create the PR
+			prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch.Name, commitMessages, "", "")
+			prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", prNumber, targetBranch.Name)
+
+			newPR, err := p.ghClient.CreatePullRequest(p.ctx, ghclient.PROptions{
+				Title:  prTitle,
+				Body:   prBody,
+				Head:   branchName,
+				Base:   targetBranch.Name,
+				Labels: []string{"pronto"},
+			})
+			if err != nil {
+				os.RemoveAll(tempDir)
+				result.Success = false
+				result.Status = "failed"
+				result.Message = fmt.Sprintf("Failed to create PR: %v", err)
+				results = append(results, result)
+				continue
+			}
+
+			result.Success = false // Pending PR merge
+			result.Status = "pending_pr"
+			result.Message = "Cherry-pick PR created"
+			result.CreatedPR = newPR.GetNumber()
+		}
+
+		// Clean up
+		os.RemoveAll(tempDir)
+		results = append(results, result)
+	}
+
+	// Update the tracking issue status table
+	if len(results) > 0 {
+		if err := p.updateTrackingIssueTable(trackingIssue.Number, results); err != nil {
+			log.Printf("Failed to update tracking issue #%d: %v", trackingIssue.Number, err)
+		}
+	}
+
+	return nil
+}
+
+// updateTrackingIssueTable updates the status table in a tracking issue with new results.
+func (p *PRProcessor) updateTrackingIssueTable(issueNumber int, results []BatchResult) error {
+	// Check if status table exists
+	existingComment, err := p.ghClient.FindProntoComment(p.ctx, issueNumber, StatusTableMarker)
+	if err != nil {
+		log.Printf("Error finding existing status table: %v", err)
+		return err
+	}
+
+	if existingComment == nil {
+		// No status table exists - create one
+		log.Printf("No existing status table found for issue #%d, creating initial table", issueNumber)
+		return p.createInitialStatusTable(issueNumber, results)
+	}
+
+	// Status table exists - update individual rows
+	log.Printf("Updating existing status table in issue #%d", issueNumber)
+	for _, result := range results {
+		status := result.Status
+		message := result.Message
+
+		if result.CreatedPR > 0 {
+			switch status {
+			case "pending_pr":
+				message = fmt.Sprintf("Pending merge of [PR #%d](#%d)", result.CreatedPR, result.CreatedPR)
+			case "conflict":
+				message = fmt.Sprintf("Conflicts - see [PR #%d](#%d)", result.CreatedPR, result.CreatedPR)
+			}
+		}
+
+		if err := UpdateTrackingIssue(p.ctx, p.ghClient, issueNumber, result.PRNumber, result.TargetBranch, status, message); err != nil {
+			log.Printf("Failed to update row in tracking issue: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// createInitialStatusTable creates the initial status table when processing from PR merge.
+func (p *PRProcessor) createInitialStatusTable(issueNumber int, results []BatchResult) error {
+	var sb strings.Builder
+	sb.WriteString("## 🤖 PROnto Batch Summary\n\n")
+
+	// Count unique PRs and branches
+	uniquePRs := make(map[int]bool)
+	uniqueBranches := make(map[string]bool)
+	for _, r := range results {
+		uniquePRs[r.PRNumber] = true
+		uniqueBranches[r.TargetBranch] = true
+	}
+
+	sb.WriteString(fmt.Sprintf("Processed %d PR(s) to %d unique branch(es):\n\n",
+		len(uniquePRs), len(uniqueBranches)))
+
+	// Create table
+	sb.WriteString("| PR | Branch | Status | Details |\n")
+	sb.WriteString("|----|--------|--------|---------|")
+
+	var successCount, failedCount, skippedCount, pendingCount, conflictCount int
+
+	for _, r := range results {
+		sb.WriteString("\n")
+
+		// Status emoji
+		statusEmoji := ""
+		switch r.Status {
+		case "success":
+			statusEmoji = "✅"
+			successCount++
+		case "failed":
+			statusEmoji = "❌"
+			failedCount++
+		case "skipped":
+			statusEmoji = "⏭️"
+			skippedCount++
+		case "pending_pr":
+			statusEmoji = "🔄"
+			pendingCount++
+		case "conflict":
+			statusEmoji = "⚠️"
+			conflictCount++
+		}
+
+		// Format message
+		msg := r.Message
+		if r.CreatedPR > 0 {
+			switch r.Status {
+			case "conflict":
+				msg = fmt.Sprintf("Conflicts - see [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
+			case "pending_pr":
+				msg = fmt.Sprintf("Pending merge of [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
+			}
+		}
+
+		// Sanitize message for markdown table
+		msg = sanitizeTableCell(msg)
+
+		fmt.Fprintf(&sb, "| [#%d](#%d) | `%s` | %s | %s |",
+			r.PRNumber, r.PRNumber, r.TargetBranch, statusEmoji, msg)
+	}
+
+	// Add summary
+	sb.WriteString("\n\n**Summary:**\n")
+	if successCount > 0 {
+		fmt.Fprintf(&sb, "- ✅ Success: %d\n", successCount)
+	}
+	if pendingCount > 0 {
+		fmt.Fprintf(&sb, "- 🔄 Pending PR merge: %d\n", pendingCount)
+	}
+	if conflictCount > 0 {
+		fmt.Fprintf(&sb, "- ⚠️ Conflicts (manual resolution needed): %d\n", conflictCount)
+	}
+	if failedCount > 0 {
+		fmt.Fprintf(&sb, "- ❌ Failed: %d\n", failedCount)
+	}
+	if skippedCount > 0 {
+		fmt.Fprintf(&sb, "- ⏭️ Skipped: %d\n", skippedCount)
+	}
+
+	sb.WriteString("\n---\n")
+	sb.WriteString("🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)")
+
+	// Create the comment
+	if err := p.ghClient.AddComment(p.ctx, issueNumber, sb.String()); err != nil {
+		return fmt.Errorf("failed to create status table comment: %w", err)
+	}
+
+	log.Printf("✅ Created initial status table on issue #%d with %d results", issueNumber, len(results))
+	return nil
+}
+
 // getUserForPermissionCheck determines which user to check permissions for.
 func (p *PRProcessor) getUserForPermissionCheck(action EventAction) string {
 	switch action {
@@ -661,4 +1091,3 @@ func (p *PRProcessor) getUserForPermissionCheck(action EventAction) string {
 
 	return ""
 }
-

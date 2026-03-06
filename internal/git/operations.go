@@ -38,11 +38,11 @@ func Clone(opts CloneOptions) (*Repository, error) {
 		return nil, fmt.Errorf("failed to create clone directory: %w", err)
 	}
 
-	// Build authenticated URL
+	// Build authenticated URL using x-access-token for GitHub
 	authURL := opts.URL
 	if opts.Token != "" {
-		// Insert token into HTTPS URL: https://token@github.com/...
-		authURL = strings.Replace(opts.URL, "https://", fmt.Sprintf("https://%s@", opts.Token), 1)
+		// Use x-access-token format for GitHub authentication
+		authURL = strings.Replace(opts.URL, "https://", fmt.Sprintf("https://x-access-token:%s@", opts.Token), 1)
 	}
 
 	// Build clone command
@@ -52,13 +52,15 @@ func Clone(opts CloneOptions) (*Repository, error) {
 		args = append(args, "--depth", fmt.Sprintf("%d", opts.Depth))
 	}
 
+	// Disable credential prompting in non-interactive environments
+	args = append(args, "-c", "core.askPass=")
 	args = append(args, authURL, opts.Directory)
 
 	// Execute clone
 	cmd := exec.Command("git", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("git clone failed: %w\nOutput: %s", err, string(output))
+		return nil, fmt.Errorf("git clone failed: %w\nOutput: %s", err, SanitizeString(string(output)))
 	}
 
 	return &Repository{
@@ -94,6 +96,14 @@ func (r *Repository) Checkout(branch string) error {
 	return nil
 }
 
+// ResetHard performs a hard reset to the specified ref.
+func (r *Repository) ResetHard(ref string) error {
+	if err := r.exec("reset", "--hard", ref); err != nil {
+		return fmt.Errorf("failed to reset to %s: %w", ref, err)
+	}
+	return nil
+}
+
 // CreateBranch creates a new branch.
 func (r *Repository) CreateBranch(name string) error {
 	if err := r.exec("checkout", "-b", name); err != nil {
@@ -115,19 +125,24 @@ func (r *Repository) Fetch(remote string, refspecs ...string) error {
 
 // Push pushes changes to remote.
 func (r *Repository) Push(remote, branch string, force bool) error {
+	// Build authenticated remote URL if token is provided
+	if r.token != "" {
+		// Set push URL with authentication
+		authRemote := strings.Replace(r.remote, "https://", fmt.Sprintf("https://x-access-token:%s@", r.token), 1)
+		if err := r.exec("remote", "set-url", remote, authRemote); err != nil {
+			return fmt.Errorf("failed to set authenticated remote: %w", err)
+		}
+
+		// Disable interactive prompts to prevent "No such device" errors in CI
+		if err := r.exec("config", "--local", "core.askPass", ""); err != nil {
+			return fmt.Errorf("failed to disable askPass: %w", err)
+		}
+	}
+
 	args := []string{"push", remote, branch}
 
 	if force {
 		args = append(args, "--force")
-	}
-
-	// Build authenticated remote URL if token is provided
-	if r.token != "" {
-		// Set push URL with authentication
-		authRemote := strings.Replace(r.remote, "https://", fmt.Sprintf("https://%s@", r.token), 1)
-		if err := r.exec("remote", "set-url", remote, authRemote); err != nil {
-			return fmt.Errorf("failed to set authenticated remote: %w", err)
-		}
 	}
 
 	if err := r.exec(args...); err != nil {
@@ -163,9 +178,14 @@ func (r *Repository) PushTag(remote, tagName string) error {
 
 	// Build authenticated remote URL if token is provided
 	if r.token != "" {
-		authRemote := strings.Replace(r.remote, "https://", fmt.Sprintf("https://%s@", r.token), 1)
+		authRemote := strings.Replace(r.remote, "https://", fmt.Sprintf("https://x-access-token:%s@", r.token), 1)
 		if err := r.exec("remote", "set-url", remote, authRemote); err != nil {
 			return fmt.Errorf("failed to set authenticated remote: %w", err)
+		}
+
+		// Disable interactive prompts
+		if err := r.exec("config", "--local", "core.askPass", ""); err != nil {
+			return fmt.Errorf("failed to disable askPass: %w", err)
 		}
 	}
 

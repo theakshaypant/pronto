@@ -17,6 +17,8 @@ type CherryPickResult struct {
 }
 
 // CherryPick attempts to cherry-pick commits onto the current branch.
+// If conflicts occur, it leaves the repository in a conflicted state for the caller to handle.
+// The caller MUST call AbortCherryPick() if they don't want to resolve the conflicts.
 func (r *Repository) CherryPick(commitSHAs ...string) (*CherryPickResult, error) {
 	if len(commitSHAs) == 0 {
 		return nil, fmt.Errorf("no commits provided for cherry-pick")
@@ -35,6 +37,15 @@ func (r *Repository) CherryPick(commitSHAs ...string) (*CherryPickResult, error)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
+		// Check if cherry-pick resulted in empty commit (changes already applied)
+		if isEmptyCommitError(output) {
+			// Abort the empty cherry-pick
+			r.AbortCherryPick()
+			result.Success = true
+			result.ErrorOutput = "Changes already applied (empty commit)"
+			return result, nil
+		}
+
 		// Cherry-pick failed - check if it's due to conflicts
 		if isConflictError(output) {
 			result.Success = false
@@ -43,15 +54,15 @@ func (r *Repository) CherryPick(commitSHAs ...string) (*CherryPickResult, error)
 			// Get list of conflicted files
 			conflicted, conflictErr := r.GetConflictedFiles()
 			if conflictErr != nil {
+				// Abort cherry-pick before returning error
+				r.AbortCherryPick()
 				return result, fmt.Errorf("cherry-pick failed with conflicts, and failed to get conflicted files: %w", conflictErr)
 			}
 
 			result.ConflictedFiles = conflicted
 
-			// Abort the cherry-pick to clean up
-			if abortErr := r.AbortCherryPick(); abortErr != nil {
-				return result, fmt.Errorf("cherry-pick failed with conflicts, and failed to abort: %w", abortErr)
-			}
+			// DON'T abort here - let the caller decide how to handle conflicts
+			// The caller MUST call AbortCherryPick() if they don't resolve the conflicts
 
 			return result, nil
 		}
@@ -171,6 +182,25 @@ func isConflictError(output []byte) bool {
 	}
 
 	for _, indicator := range conflictIndicators {
+		if strings.Contains(outputStr, indicator) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isEmptyCommitError checks if git output indicates an empty commit (changes already applied).
+func isEmptyCommitError(output []byte) bool {
+	outputStr := string(output)
+
+	emptyCommitIndicators := []string{
+		"The previous cherry-pick is now empty",
+		"nothing to commit, working tree clean",
+		"no changes added to commit",
+	}
+
+	for _, indicator := range emptyCommitIndicators {
 		if strings.Contains(outputStr, indicator) {
 			return true
 		}

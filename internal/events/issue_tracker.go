@@ -14,6 +14,9 @@ import (
 const (
 	// StatusTableMarker is used to identify PROnto status table comments
 	StatusTableMarker = "## 🤖 PROnto Batch Summary"
+
+	// ValidationErrorMarker is used to identify PROnto validation error comments
+	ValidationErrorMarker = "## ⚠️ PROnto Validation Errors"
 )
 
 // TrackingIssue represents an issue that tracks PR cherry-picking operations.
@@ -25,10 +28,9 @@ type TrackingIssue struct {
 
 // FindTrackingIssues searches for open issues with pronto/* labels that reference a specific PR.
 func FindTrackingIssues(ctx context.Context, client *ghclient.Client, prNumber int, labelPattern string) ([]*TrackingIssue, error) {
-	// Search for open issues with pronto/* labels
-	// We can't directly search for PR numbers in issue bodies via API,
-	// so we search for all open issues and filter client-side
-	query := fmt.Sprintf("is:open is:issue label:%s*", labelPattern)
+	// Search for open issues that mention the PR number in the body
+	// GitHub search supports "#123" syntax in issue bodies
+	query := fmt.Sprintf("is:open is:issue #%d in:body", prNumber)
 
 	log.Printf("Searching for tracking issues with query: %s", query)
 
@@ -37,11 +39,25 @@ func FindTrackingIssues(ctx context.Context, client *ghclient.Client, prNumber i
 		return nil, fmt.Errorf("failed to search issues: %w", err)
 	}
 
-	log.Printf("Found %d open issues with pronto labels", len(issues))
+	log.Printf("Found %d open issues mentioning PR #%d", len(issues), prNumber)
 
 	var trackingIssues []*TrackingIssue
 
 	for _, issue := range issues {
+		// Check if the issue has any pronto/* labels
+		hasProntoLabel := false
+		for _, label := range issue.Labels {
+			if strings.HasPrefix(label.GetName(), labelPattern) {
+				hasProntoLabel = true
+				break
+			}
+		}
+
+		if !hasProntoLabel {
+			log.Printf("Issue #%d mentions PR #%d but has no pronto labels, skipping", issue.GetNumber(), prNumber)
+			continue
+		}
+
 		// Parse PR numbers from issue body
 		prNums := ParsePRNumbers(issue.GetBody())
 
@@ -52,7 +68,7 @@ func FindTrackingIssues(ctx context.Context, client *ghclient.Client, prNumber i
 				Issue:  issue,
 				PRNums: prNums,
 			})
-			log.Printf("Issue #%d references PR #%d", issue.GetNumber(), prNumber)
+			log.Printf("Issue #%d references PR #%d with pronto labels", issue.GetNumber(), prNumber)
 		}
 	}
 
@@ -140,9 +156,19 @@ func updateStatusTableRow(tableBody string, prNumber int, targetBranch string, n
 	}
 
 	if !rowUpdated {
-		log.Printf("Warning: No matching row found for PR #%d, branch %s", prNumber, targetBranch)
-		// Row not found - this is OK, might not be in this issue
-		return tableBody, nil
+		// Row not found - add it before the summary section
+		log.Printf("No matching row found for PR #%d, branch %s - adding new row", prNumber, targetBranch)
+
+		newRow := buildTableRow(prNumber, targetBranch, newStatus, newMessage)
+
+		// Insert the new row before the summary (tableEnd position)
+		if tableEnd < len(lines) {
+			// Insert before summary
+			lines = append(lines[:tableEnd], append([]string{newRow}, lines[tableEnd:]...)...)
+		} else {
+			// Append at end if no summary found
+			lines = append(lines, newRow)
+		}
 	}
 
 	// Recalculate summary counts
@@ -201,6 +227,9 @@ func buildTableRow(prNumber int, targetBranch string, status string, message str
 	default:
 		statusEmoji = "❓"
 	}
+
+	// Sanitize message to prevent table formatting issues
+	message = sanitizeTableCell(message)
 
 	return fmt.Sprintf("| [#%d](#%d) | `%s` | %s | %s |",
 		prNumber, prNumber, targetBranch, statusEmoji, message)

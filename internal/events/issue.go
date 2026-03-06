@@ -114,6 +114,15 @@ func (p *IssueProcessor) Process(action EventAction) error {
 		return p.handleIssueClosed(targetBranches, mergedPRs)
 	}
 
+	// Check if we should skip processing - this prevents duplicate comments
+	// when multiple issue events fire (opened, labeled, edited, etc.)
+	// Only check this for non-closed issues
+	shouldSkip, reason := p.shouldSkipProcessing(issue.GetNumber(), prNumbers, targetBranches)
+	if shouldSkip {
+		log.Printf("Skipping processing of issue #%d: %s", issue.GetNumber(), reason)
+		return nil
+	}
+
 	// Get the user who triggered the action
 	username := p.getUserForPermissionCheck(action)
 	log.Printf("Checking permissions for user: %s", username)
@@ -226,10 +235,50 @@ func (p *IssueProcessor) processPRBranch(prNum int, pr *github.PullRequest, targ
 		return result
 	}
 
-	if !exists {
+	// Handle branch creation if specified with .. notation
+	if !exists && targetBranch.ShouldCreate {
+		log.Printf("Branch %s does not exist, creating from %s", branchName, targetBranch.BaseBranch)
+
+		// Verify base branch exists
+		baseExists, err := p.ghClient.BranchExists(p.ctx, targetBranch.BaseBranch)
+		if err != nil {
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to check if base branch `%s` exists: %v", targetBranch.BaseBranch, err)
+			return result
+		}
+
+		if !baseExists {
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Cannot create branch because the base branch `%s` does not exist", targetBranch.BaseBranch)
+			return result
+		}
+
+		// Get base branch SHA
+		baseSHA, err := p.ghClient.GetBranchSHA(p.ctx, targetBranch.BaseBranch)
+		if err != nil {
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to get base branch SHA: %v", err)
+			return result
+		}
+
+		// Create the target branch
+		if err := p.ghClient.CreateBranch(p.ctx, branchName, baseSHA); err != nil {
+			result.Success = false
+			result.Status = "failed"
+			result.Message = fmt.Sprintf("Failed to create target branch: %v", err)
+			return result
+		}
+
+		log.Printf("Successfully created branch %s from %s", branchName, targetBranch.BaseBranch)
+		// Continue processing to cherry-pick to the newly created branch
+	} else if !exists {
+		// Branch doesn't exist and no .. notation specified
 		result.Success = false
 		result.Status = "failed"
-		result.Message = "Branch does not exist"
+		result.Message = fmt.Sprintf("Branch does not exist. Use label `%s%s..base-branch` to create it automatically", p.config.LabelPattern, branchName)
 		return result
 	}
 
@@ -301,7 +350,7 @@ func (p *IssueProcessor) processPRBranch(prNum int, pr *github.PullRequest, targ
 		if err := repo.Push("origin", branchName, false); err != nil {
 			result.Success = false
 			result.Status = "failed"
-			result.Message = fmt.Sprintf("Failed to push to target branch: %v", err)
+			result.Message = fmt.Sprintf("Failed to push to target branch: %s", git.SanitizeError(err))
 			return result
 		}
 
@@ -329,7 +378,7 @@ func (p *IssueProcessor) processPRBranch(prNum int, pr *github.PullRequest, targ
 	if err := repo.Push("origin", cherryPickBranch, false); err != nil {
 		result.Success = false
 		result.Status = "failed"
-		result.Message = fmt.Sprintf("Failed to push cherry-pick branch: %v", err)
+		result.Message = fmt.Sprintf("Failed to push cherry-pick branch: %s", git.SanitizeError(err))
 		return result
 	}
 
@@ -367,14 +416,37 @@ func (p *IssueProcessor) createConflictPR(repo *git.Repository, prNum int, targe
 		TargetBranch: targetBranch,
 	}
 
-	// Get conflict details
+	// Get conflict details while we still have the conflicts in working tree
 	details, err := repo.GetConflictDetails()
 	if err != nil {
 		log.Printf("Failed to get conflict details: %v", err)
 		details = fmt.Sprintf("Conflicts in %d file(s)", len(cherryPickResult.ConflictedFiles))
 	}
 
-	// Create a new branch for the conflict PR
+	// Stage all files (including conflicts with markers)
+	// This must be done while still in the conflicted cherry-pick state
+	if err := repo.StageAll(); err != nil {
+		// Abort cherry-pick before returning
+		repo.AbortCherryPick()
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to stage conflicted files: %v", err)
+		return result
+	}
+
+	// Commit the conflicts to complete the cherry-pick
+	// This creates a commit with conflict markers that can be resolved later
+	commitMsg := fmt.Sprintf("Cherry-pick PR #%d to %s (conflicts)\n\nConflicts need manual resolution", prNum, targetBranch)
+	if err := repo.Commit(commitMsg); err != nil {
+		// Abort cherry-pick before returning
+		repo.AbortCherryPick()
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to commit conflicts: %v", err)
+		return result
+	}
+
+	// Now create a new branch from this commit
 	conflictBranch := fmt.Sprintf("pronto/%s/pr-%d-conflicts", targetBranch, prNum)
 	log.Printf("Creating conflict branch: %s", conflictBranch)
 
@@ -385,30 +457,24 @@ func (p *IssueProcessor) createConflictPR(repo *git.Repository, prNum int, targe
 		return result
 	}
 
-	// Stage all files (including conflicts)
-	if err := repo.StageAll(); err != nil {
+	// Push the conflict branch (force push in case it exists from a previous attempt)
+	log.Printf("Pushing conflict branch to origin (force)")
+	if err := repo.Push("origin", conflictBranch, true); err != nil {
 		result.Success = false
 		result.Status = "failed"
-		result.Message = fmt.Sprintf("Failed to stage conflicted files: %v", err)
+		result.Message = fmt.Sprintf("Failed to push conflict branch: %s", git.SanitizeError(err))
 		return result
 	}
 
-	// Commit the conflicts
-	commitMsg := fmt.Sprintf("Cherry-pick PR #%d to %s (conflicts)\n\nConflicts need manual resolution", prNum, targetBranch)
-	if err := repo.Commit(commitMsg); err != nil {
-		result.Success = false
-		result.Status = "failed"
-		result.Message = fmt.Sprintf("Failed to commit conflicts: %v", err)
-		return result
-	}
-
-	// Push the branch
-	log.Printf("Pushing conflict branch to origin")
-	if err := repo.Push("origin", conflictBranch, false); err != nil {
-		result.Success = false
-		result.Status = "failed"
-		result.Message = fmt.Sprintf("Failed to push conflict branch: %v", err)
-		return result
+	// Checkout back to the base branch and reset it to remove the conflict commit
+	// We want the base branch clean, with only the conflict branch having the markers
+	if err := repo.Checkout(targetBranch); err != nil {
+		log.Printf("Warning: Failed to checkout back to %s: %v", targetBranch, err)
+	} else {
+		// Reset to HEAD~1 to remove the conflict commit we just created
+		if err := repo.ResetHard("HEAD~1"); err != nil {
+			log.Printf("Warning: Failed to reset %s: %v", targetBranch, err)
+		}
 	}
 
 	// Create PR with conflict label
@@ -435,7 +501,7 @@ func (p *IssueProcessor) createConflictPR(repo *git.Repository, prNum int, targe
 
 	result.Success = false // Mark as failed since manual resolution is needed
 	result.Status = "conflict"
-	result.Message = fmt.Sprintf("Conflicts - manual resolution needed")
+	result.Message = "Conflicts - manual resolution needed"
 	result.CreatedPR = newPR.GetNumber()
 	return result
 }
@@ -483,12 +549,16 @@ func (p *IssueProcessor) createTableComment(results []BatchResult) error {
 		// Format message
 		msg := r.Message
 		if r.CreatedPR > 0 {
-			if r.Status == "conflict" {
+			switch r.Status {
+			case "conflict":
 				msg = fmt.Sprintf("Conflicts - see [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
-			} else if r.Status == "pending_pr" {
+			case "pending_pr":
 				msg = fmt.Sprintf("Pending merge of [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
 			}
 		}
+
+		// Sanitize message for markdown table - remove newlines and pipes
+		msg = sanitizeTableCell(msg)
 
 		fmt.Fprintf(&sb, "| [#%d](#%d) | `%s` | %s | %s |",
 			r.PRNumber, r.PRNumber, r.TargetBranch, statusEmoji, msg)
@@ -517,11 +587,29 @@ func (p *IssueProcessor) createTableComment(results []BatchResult) error {
 
 	comment := sb.String()
 
-	if err := p.ghClient.AddComment(p.ctx, issue.GetNumber(), comment); err != nil {
-		return fmt.Errorf("failed to add status table comment: %w", err)
+	// Check if a status table comment already exists
+	existingComment, err := p.ghClient.FindProntoComment(p.ctx, issue.GetNumber(), StatusTableMarker)
+	if err != nil {
+		log.Printf("Error finding existing status table comment: %v", err)
+		return fmt.Errorf("failed to check for existing status table: %w", err)
 	}
 
-	log.Printf("Added status table comment to issue #%d with %d results", issue.GetNumber(), len(results))
+	if existingComment != nil {
+		// Update existing comment
+		log.Printf("Found existing status table comment #%d, updating it", existingComment.GetID())
+		if err := p.ghClient.UpdateComment(p.ctx, existingComment.GetID(), comment); err != nil {
+			return fmt.Errorf("failed to update status table comment: %w", err)
+		}
+		log.Printf("✅ Updated existing status table comment on issue #%d with %d results", issue.GetNumber(), len(results))
+	} else {
+		// Create new comment
+		log.Printf("No existing status table found, creating new one")
+		if err := p.ghClient.AddComment(p.ctx, issue.GetNumber(), comment); err != nil {
+			return fmt.Errorf("failed to add status table comment: %w", err)
+		}
+		log.Printf("✅ Created new status table comment on issue #%d with %d results", issue.GetNumber(), len(results))
+	}
+
 	return nil
 }
 
@@ -546,16 +634,178 @@ func (p *IssueProcessor) createValidationErrorComment(validationResults []PRVali
 	sb.WriteString("\n---\n")
 	sb.WriteString("🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)")
 
-	return p.ghClient.AddComment(p.ctx, issue.GetNumber(), sb.String())
+	comment := sb.String()
+
+	// Check if a validation error comment already exists
+	existingComment, err := p.ghClient.FindProntoComment(p.ctx, issue.GetNumber(), ValidationErrorMarker)
+	if err != nil {
+		return fmt.Errorf("failed to check for existing validation error comment: %w", err)
+	}
+
+	if existingComment != nil {
+		// Update existing comment
+		if err := p.ghClient.UpdateComment(p.ctx, existingComment.GetID(), comment); err != nil {
+			return fmt.Errorf("failed to update validation error comment: %w", err)
+		}
+		log.Printf("Updated existing validation error comment on issue #%d", issue.GetNumber())
+	} else {
+		// Create new comment
+		if err := p.ghClient.AddComment(p.ctx, issue.GetNumber(), comment); err != nil {
+			return fmt.Errorf("failed to add validation error comment: %w", err)
+		}
+		log.Printf("Added validation error comment to issue #%d", issue.GetNumber())
+	}
+
+	return nil
+}
+
+// shouldSkipProcessing determines if we should skip processing this issue.
+// This prevents duplicate comments when multiple issue events fire in quick succession.
+func (p *IssueProcessor) shouldSkipProcessing(issueNumber int, prNumbers []int, targetBranches []*models.TargetBranch) (bool, string) {
+	// Check for existing status table
+	existingTable, err := p.ghClient.FindProntoComment(p.ctx, issueNumber, StatusTableMarker)
+	if err != nil {
+		log.Printf("Error checking for existing status table: %v", err)
+		return false, ""
+	}
+
+	// If no status table exists, we should process (might create validation errors)
+	if existingTable == nil {
+		log.Printf("No existing status table found, will process issue")
+		return false, ""
+	}
+
+	// Status table exists - check if all PRs are already tracked
+	tableBody := existingTable.GetBody()
+
+	// Count how many PRs from the issue body are already in the table
+	prsInTable := 0
+	for _, prNum := range prNumbers {
+		// Check if this PR appears in the table
+		if strings.Contains(tableBody, fmt.Sprintf("[#%d](#%d)", prNum, prNum)) {
+			prsInTable++
+		}
+	}
+
+	// Count how many branches are in the table
+	branchesInTable := 0
+	for _, branch := range targetBranches {
+		if strings.Contains(tableBody, fmt.Sprintf("`%s`", branch.Name)) {
+			branchesInTable++
+		}
+	}
+
+	// If all PRs and all branches are already in the table, skip processing
+	if prsInTable == len(prNumbers) && branchesInTable == len(targetBranches) {
+		log.Printf("All %d PRs and %d branches already in status table", prsInTable, branchesInTable)
+		return true, "status table already contains all PRs and branches"
+	}
+
+	// Some PRs or branches are missing - should process to update
+	log.Printf("Status table exists but missing some PRs (%d/%d) or branches (%d/%d), will process",
+		prsInTable, len(prNumbers), branchesInTable, len(targetBranches))
+	return false, ""
 }
 
 // handleIssueClosed handles tag creation when an issue is closed.
 func (p *IssueProcessor) handleIssueClosed(targetBranches []*models.TargetBranch, mergedPRs []int) error {
-	log.Printf("Issue closed, checking for tag creation")
+	issue := p.event.Issue
+	log.Printf("Issue #%d closed, checking for tag creation", issue.GetNumber())
 
-	// TODO: Implement tag creation logic
+	// Find branches with tag names specified
+	var tagsToCreate []struct {
+		branch string
+		tag    string
+	}
 
-	log.Printf("Tag creation on issue close not yet implemented")
+	for _, tb := range targetBranches {
+		if tb.TagName != "" {
+			tagsToCreate = append(tagsToCreate, struct {
+				branch string
+				tag    string
+			}{branch: tb.Name, tag: tb.TagName})
+		}
+	}
+
+	if len(tagsToCreate) == 0 {
+		log.Printf("No tags specified in issue labels")
+		return nil
+	}
+
+	log.Printf("Found %d tag(s) to create", len(tagsToCreate))
+
+	var createdTags []string
+	var failedTags []string
+
+	for _, tagInfo := range tagsToCreate {
+		log.Printf("Creating tag %s on branch %s", tagInfo.tag, tagInfo.branch)
+
+		// Check if branch exists
+		branchExists, err := p.ghClient.BranchExists(p.ctx, tagInfo.branch)
+		if err != nil {
+			log.Printf("Failed to check if branch %s exists: %v", tagInfo.branch, err)
+			failedTags = append(failedTags, fmt.Sprintf("%s (branch check failed)", tagInfo.tag))
+			continue
+		}
+
+		if !branchExists {
+			log.Printf("Branch %s does not exist, skipping tag %s", tagInfo.branch, tagInfo.tag)
+			failedTags = append(failedTags, fmt.Sprintf("%s (branch not found)", tagInfo.tag))
+			continue
+		}
+
+		// Get current SHA of the target branch
+		branchSHA, err := p.ghClient.GetBranchSHA(p.ctx, tagInfo.branch)
+		if err != nil {
+			log.Printf("Failed to get SHA for branch %s: %v", tagInfo.branch, err)
+			failedTags = append(failedTags, fmt.Sprintf("%s (failed to get SHA)", tagInfo.tag))
+			continue
+		}
+
+		// Create tag message
+		tagMessage := fmt.Sprintf("Release tag for issue #%d\n\nBranch: %s\nPRs included: %v",
+			issue.GetNumber(), tagInfo.branch, mergedPRs)
+
+		// Create annotated tag
+		if err := p.ghClient.CreateTag(p.ctx, tagInfo.tag, branchSHA, tagMessage); err != nil {
+			log.Printf("Failed to create tag %s: %v", tagInfo.tag, err)
+			failedTags = append(failedTags, fmt.Sprintf("%s (%v)", tagInfo.tag, err))
+			continue
+		}
+
+		log.Printf("Successfully created tag %s on branch %s at SHA %s", tagInfo.tag, tagInfo.branch, branchSHA[:7])
+		createdTags = append(createdTags, fmt.Sprintf("`%s` on `%s`", tagInfo.tag, tagInfo.branch))
+	}
+
+	// Post comment to issue about tag creation
+	if len(createdTags) > 0 || len(failedTags) > 0 {
+		var comment strings.Builder
+		comment.WriteString("## 🏷️ Tag Creation Summary\n\n")
+
+		if len(createdTags) > 0 {
+			comment.WriteString("**✅ Tags created:**\n")
+			for _, tag := range createdTags {
+				comment.WriteString(fmt.Sprintf("- %s\n", tag))
+			}
+			comment.WriteString("\n")
+		}
+
+		if len(failedTags) > 0 {
+			comment.WriteString("**❌ Failed to create:**\n")
+			for _, tag := range failedTags {
+				comment.WriteString(fmt.Sprintf("- %s\n", tag))
+			}
+			comment.WriteString("\n")
+		}
+
+		comment.WriteString("---\n")
+		comment.WriteString("🤖 Automated by [PROnto](https://github.com/theakshaypant/pronto)")
+
+		if err := p.ghClient.AddComment(p.ctx, issue.GetNumber(), comment.String()); err != nil {
+			log.Printf("Failed to add tag creation comment: %v", err)
+		}
+	}
+
 	return nil
 }
 
@@ -625,4 +875,24 @@ func countUniqueBranches(results []BatchResult) int {
 		seen[r.TargetBranch] = true
 	}
 	return len(seen)
+}
+
+// sanitizeTableCell removes characters that would break markdown table formatting.
+func sanitizeTableCell(msg string) string {
+	// Replace newlines with spaces
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.ReplaceAll(msg, "\r", " ")
+
+	// Replace pipe characters with similar-looking character to avoid breaking table
+	msg = strings.ReplaceAll(msg, "|", "ǀ")
+
+	// Collapse multiple spaces into one
+	msg = strings.Join(strings.Fields(msg), " ")
+
+	// Trim to reasonable length for table display
+	if len(msg) > 100 {
+		msg = msg[:97] + "..."
+	}
+
+	return msg
 }

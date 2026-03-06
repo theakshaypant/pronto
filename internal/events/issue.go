@@ -289,11 +289,9 @@ func (p *IssueProcessor) processPRBranch(prNum int, pr *github.PullRequest, targ
 
 	// Handle cherry-pick result
 	if !cherryPickResult.Success {
-		// Conflicts detected
-		result.Success = false
-		result.Status = "failed"
-		result.Message = fmt.Sprintf("Cherry-pick conflicts in %d file(s)", len(cherryPickResult.ConflictedFiles))
-		return result
+		// Conflicts detected - create a PR for manual resolution
+		log.Printf("Cherry-pick has conflicts, creating conflict PR")
+		return p.createConflictPR(repo, prNum, branchName, commitMessages, cherryPickResult)
 	}
 
 	// Cherry-pick succeeded - push or create PR
@@ -362,6 +360,86 @@ func (p *IssueProcessor) processPRBranch(prNum int, pr *github.PullRequest, targ
 	return result
 }
 
+// createConflictPR creates a PR with conflicted cherry-pick for manual resolution.
+func (p *IssueProcessor) createConflictPR(repo *git.Repository, prNum int, targetBranch string, commitMessages []string, cherryPickResult *git.CherryPickResult) BatchResult {
+	result := BatchResult{
+		PRNumber:     prNum,
+		TargetBranch: targetBranch,
+	}
+
+	// Get conflict details
+	details, err := repo.GetConflictDetails()
+	if err != nil {
+		log.Printf("Failed to get conflict details: %v", err)
+		details = fmt.Sprintf("Conflicts in %d file(s)", len(cherryPickResult.ConflictedFiles))
+	}
+
+	// Create a new branch for the conflict PR
+	conflictBranch := fmt.Sprintf("pronto/%s/pr-%d-conflicts", targetBranch, prNum)
+	log.Printf("Creating conflict branch: %s", conflictBranch)
+
+	if err := repo.CreateBranch(conflictBranch); err != nil {
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to create conflict branch: %v", err)
+		return result
+	}
+
+	// Stage all files (including conflicts)
+	if err := repo.StageAll(); err != nil {
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to stage conflicted files: %v", err)
+		return result
+	}
+
+	// Commit the conflicts
+	commitMsg := fmt.Sprintf("Cherry-pick PR #%d to %s (conflicts)\n\nConflicts need manual resolution", prNum, targetBranch)
+	if err := repo.Commit(commitMsg); err != nil {
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to commit conflicts: %v", err)
+		return result
+	}
+
+	// Push the branch
+	log.Printf("Pushing conflict branch to origin")
+	if err := repo.Push("origin", conflictBranch, false); err != nil {
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to push conflict branch: %v", err)
+		return result
+	}
+
+	// Create PR with conflict label
+	prBody := ghclient.FormatConflictPRBody(prNum, targetBranch, commitMessages, details, "")
+	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s (CONFLICTS)", prNum, targetBranch)
+
+	labels := []string{"pronto", p.config.ConflictLabel}
+
+	newPR, err := p.ghClient.CreatePullRequest(p.ctx, ghclient.PROptions{
+		Title:  prTitle,
+		Body:   prBody,
+		Head:   conflictBranch,
+		Base:   targetBranch,
+		Labels: labels,
+	})
+	if err != nil {
+		result.Success = false
+		result.Status = "failed"
+		result.Message = fmt.Sprintf("Failed to create conflict PR: %v", err)
+		return result
+	}
+
+	log.Printf("Created conflict PR #%d", newPR.GetNumber())
+
+	result.Success = false // Mark as failed since manual resolution is needed
+	result.Status = "conflict"
+	result.Message = fmt.Sprintf("Conflicts - manual resolution needed")
+	result.CreatedPR = newPR.GetNumber()
+	return result
+}
+
 // createTableComment creates a status table comment on the issue.
 func (p *IssueProcessor) createTableComment(results []BatchResult) error {
 	issue := p.event.Issue
@@ -376,6 +454,8 @@ func (p *IssueProcessor) createTableComment(results []BatchResult) error {
 	sb.WriteString("|----|--------|--------|---------|")
 
 	var successCount, failedCount, skippedCount, pendingCount int
+
+	var conflictCount int
 
 	for _, r := range results {
 		sb.WriteString("\n")
@@ -395,12 +475,19 @@ func (p *IssueProcessor) createTableComment(results []BatchResult) error {
 		case "pending_pr":
 			statusEmoji = "🔄"
 			pendingCount++
+		case "conflict":
+			statusEmoji = "⚠️"
+			conflictCount++
 		}
 
 		// Format message
 		msg := r.Message
 		if r.CreatedPR > 0 {
-			msg = fmt.Sprintf("Pending merge of [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
+			if r.Status == "conflict" {
+				msg = fmt.Sprintf("Conflicts - see [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
+			} else if r.Status == "pending_pr" {
+				msg = fmt.Sprintf("Pending merge of [PR #%d](#%d)", r.CreatedPR, r.CreatedPR)
+			}
 		}
 
 		fmt.Fprintf(&sb, "| [#%d](#%d) | `%s` | %s | %s |",
@@ -414,6 +501,9 @@ func (p *IssueProcessor) createTableComment(results []BatchResult) error {
 	}
 	if pendingCount > 0 {
 		fmt.Fprintf(&sb, "- 🔄 Pending PR merge: %d\n", pendingCount)
+	}
+	if conflictCount > 0 {
+		fmt.Fprintf(&sb, "- ⚠️ Conflicts (manual resolution needed): %d\n", conflictCount)
 	}
 	if failedCount > 0 {
 		fmt.Fprintf(&sb, "- ❌ Failed: %d\n", failedCount)

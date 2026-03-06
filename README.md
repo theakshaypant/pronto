@@ -111,6 +111,16 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
+### Required Repository Setting
+
+To allow PROnto to create pull requests (for conflict resolution or when you don't have write access), you must enable a repository setting:
+
+1. Go to your repository **Settings** → **Actions** → **General**
+2. Scroll down to **Workflow permissions**
+3. Enable: **"Allow GitHub Actions to create and approve pull requests"**
+
+Without this setting, PROnto will fail when trying to create cherry-pick PRs with a `403` error.
+
 **When to use each option:**
 
 - **Option 1 (PR-only)**: You only need single PR cherry-picking. Simpler setup, no issue permissions needed.

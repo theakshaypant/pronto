@@ -141,6 +141,11 @@ func (p *PRProcessor) Process(action EventAction) error {
 		}
 	}
 
+	// Update tracking issues if this is a cherry-pick PR merge
+	if err := p.updateTrackingIssues(); err != nil {
+		log.Printf("Failed to update tracking issues: %v", err)
+	}
+
 	return nil
 }
 
@@ -533,6 +538,105 @@ func extractCommitSHAsFromMessages(messages []string) []string {
 		}
 	}
 	return shas
+}
+
+// updateTrackingIssues updates tracking issues when a cherry-pick PR merges.
+func (p *PRProcessor) updateTrackingIssues() error {
+	pr := p.event.PullRequest
+
+	// Check if this is a PROnto-created cherry-pick PR
+	// These PRs have the "pronto" label and follow the branch naming pattern: pronto/{branch}/pr-{num}
+	if !p.isProntoCherryPickPR() {
+		return nil // Not a cherry-pick PR, nothing to do
+	}
+
+	// Extract original PR number and target branch from branch name
+	branchName := pr.GetHead().GetRef()
+	originalPR, targetBranch, err := parseCherryPickBranchName(branchName)
+	if err != nil {
+		log.Printf("Failed to parse cherry-pick branch name %s: %v", branchName, err)
+		return nil // Invalid branch name format, skip
+	}
+
+	log.Printf("Cherry-pick PR #%d merged: original PR #%d, target branch %s",
+		pr.GetNumber(), originalPR, targetBranch)
+
+	// Find tracking issues that reference the original PR
+	trackingIssues, err := FindTrackingIssues(p.ctx, p.ghClient, originalPR, p.config.LabelPattern)
+	if err != nil {
+		return fmt.Errorf("failed to find tracking issues: %w", err)
+	}
+
+	if len(trackingIssues) == 0 {
+		log.Printf("No tracking issues found for PR #%d", originalPR)
+		return nil
+	}
+
+	log.Printf("Found %d tracking issue(s) for PR #%d", len(trackingIssues), originalPR)
+
+	// Update each tracking issue
+	for _, issue := range trackingIssues {
+		newMessage := fmt.Sprintf("Cherry-picked via [PR #%d](#%d)", pr.GetNumber(), pr.GetNumber())
+
+		if err := UpdateTrackingIssue(p.ctx, p.ghClient, issue.Number, originalPR, targetBranch, "success", newMessage); err != nil {
+			log.Printf("Failed to update tracking issue #%d: %v", issue.Number, err)
+			continue
+		}
+
+		log.Printf("Successfully updated tracking issue #%d", issue.Number)
+	}
+
+	return nil
+}
+
+// isProntoCherryPickPR checks if the current PR is a PROnto-created cherry-pick PR.
+func (p *PRProcessor) isProntoCherryPickPR() bool {
+	pr := p.event.PullRequest
+
+	// Check for "pronto" label
+	for _, label := range pr.Labels {
+		if label.GetName() == "pronto" {
+			// Check branch name pattern
+			branchName := pr.GetHead().GetRef()
+			if strings.HasPrefix(branchName, "pronto/") && strings.Contains(branchName, "/pr-") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// parseCherryPickBranchName extracts the original PR number and target branch from a cherry-pick branch name.
+// Format: pronto/{target-branch}/pr-{original-pr-number}
+// Example: pronto/release-1.0/pr-123 -> (123, "release-1.0", nil)
+func parseCherryPickBranchName(branchName string) (prNumber int, targetBranch string, err error) {
+	// Pattern: pronto/{branch}/pr-{num}
+	parts := strings.Split(branchName, "/")
+	if len(parts) < 3 {
+		return 0, "", fmt.Errorf("invalid branch name format: expected pronto/{branch}/pr-{num}")
+	}
+
+	if parts[0] != "pronto" {
+		return 0, "", fmt.Errorf("branch does not start with pronto/")
+	}
+
+	// Extract PR number from last part (pr-{num})
+	prPart := parts[len(parts)-1]
+	if !strings.HasPrefix(prPart, "pr-") {
+		return 0, "", fmt.Errorf("invalid PR part: expected pr-{num}")
+	}
+
+	prNumStr := strings.TrimPrefix(prPart, "pr-")
+	prNum, err := fmt.Sscanf(prNumStr, "%d", &prNumber)
+	if err != nil || prNum != 1 {
+		return 0, "", fmt.Errorf("invalid PR number: %s", prNumStr)
+	}
+
+	// Extract target branch (everything between pronto/ and /pr-{num})
+	targetBranch = strings.Join(parts[1:len(parts)-1], "/")
+
+	return prNumber, targetBranch, nil
 }
 
 // getUserForPermissionCheck determines which user to check permissions for.

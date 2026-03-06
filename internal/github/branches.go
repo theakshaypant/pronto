@@ -64,3 +64,34 @@ func (c *Client) DeleteBranch(ctx context.Context, branchName string) error {
 
 	return nil
 }
+
+// CreateTag creates an annotated tag at the specified commit SHA.
+func (c *Client) CreateTag(ctx context.Context, tagName, sha, message string) error {
+	// First, create the tag object (annotated tag)
+	tagType := "commit"
+	tag := github.CreateTag{
+		Tag:     tagName,
+		Message: message,
+		Object:  sha,
+		Type:    tagType,
+	}
+
+	createdTag, _, err := c.client.Git.CreateTag(ctx, c.owner, c.repo, tag)
+	if err != nil {
+		return fmt.Errorf("failed to create tag object: %w", err)
+	}
+
+	// Then, create the reference to the tag
+	ref := fmt.Sprintf("refs/tags/%s", tagName)
+	createRef := github.CreateRef{
+		Ref: ref,
+		SHA: *createdTag.SHA,
+	}
+
+	_, _, err = c.client.Git.CreateRef(ctx, c.owner, c.repo, createRef)
+	if err != nil {
+		return fmt.Errorf("failed to create tag reference: %w", err)
+	}
+
+	return nil
+}

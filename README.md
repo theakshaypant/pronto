@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged == true
     steps:
-      - uses: theakshaypant/pronto@v1
+      - uses: theakshaypant/pronto@v0.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -76,7 +76,7 @@ jobs:
       github.event_name == 'issues' ||
       (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
     steps:
-      - uses: theakshaypant/pronto@v1
+      - uses: theakshaypant/pronto@v0.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -106,7 +106,7 @@ jobs:
       (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
       github.event_name == 'issues'
     steps:
-      - uses: theakshaypant/pronto@v1
+      - uses: theakshaypant/pronto@v0.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -218,7 +218,7 @@ Issue labels:
 All inputs are optional except `github_token`.
 
 ```yaml
-- uses: theakshaypant/pronto@v1
+- uses: theakshaypant/pronto@v0.1
   with:
     github_token: ${{ secrets.GITHUB_TOKEN }}
     label_pattern: 'pronto/'           # default

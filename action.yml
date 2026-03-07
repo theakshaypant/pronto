@@ -1,4 +1,4 @@
-name: 'PROnto'
+name: 'PROnto - Label-Based Cherry-Pick Automation'
 description: 'Automate cherry-picking PR-onto release branches using labels'
 author: 'Akshay Pant'
 branding:

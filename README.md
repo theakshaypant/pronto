@@ -8,6 +8,17 @@ You know that feeling when you merge a bug fix to `main`, then realize you need 
 
 **PROnto does it for you.** Merge your PR, add a `pronto/release-1.0` label, and walk away. The commits get cherry-picked automatically.
 
+## See it in action
+
+Want to see what actually happens? Check out the [test repository](https://github.com/theakshaypant/pronto-test-1772806636) to see real PROnto runs:
+
+- **[PR #1](https://github.com/theakshaypant/pronto-test-1772806636/pull/1)** - Cherry-pick to an existing branch + create a new branch
+- **[PR #2](https://github.com/theakshaypant/pronto-test-1772806636/pull/2)** - Cherry-pick with automatic tag creation (`?tag=v1.0.0-test`)
+- **[PR #3](https://github.com/theakshaypant/pronto-test-1772806636/pull/3)** - Create branch from base, cherry-pick, and tag (`..main?tag=v2.0.0-rc1`)
+- **[PR #5](https://github.com/theakshaypant/pronto-test-1772806636/pull/5)** - Auto-created conflict resolution PR (from PR #4 conflicting on `release-1.0`)
+- **[Issue #6](https://github.com/theakshaypant/pronto-test-1772806636/issues/6)** - Batch cherry-pick via tracking issue with status table
+- **[Issue #11](https://github.com/theakshaypant/pronto-test-1772806636/issues/11)** - Batch cherry-pick with branch creation and tag creation on close.
+
 ## How it works
 
 **Single PR cherry-picking:**

@@ -23,7 +23,7 @@ func TestSanitizeError(t *testing.T) {
 		},
 		{
 			name:     "error with ghp_ token in URL",
-			err:      errors.New("failed: https://ghp_1234567890abcdefghijklmnopqrstuvwxyz@github.com failed"),
+			err:      errors.New("failed: https://ghp_1234567890abcdefghijklmnopqrstuvwxyz@github.com failed"), // notsecret
 			expected: "failed: https://***@github.com failed",
 		},
 		{
@@ -61,7 +61,7 @@ func TestSanitizeString(t *testing.T) {
 		},
 		{
 			name:     "URL with ghp_ token",
-			input:    "clone failed: https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com",
+			input:    "clone failed: https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com", // notsecret
 			expected: "clone failed: https://***@github.com",
 		},
 		{
@@ -71,7 +71,7 @@ func TestSanitizeString(t *testing.T) {
 		},
 		{
 			name:     "multiple tokens",
-			input:    "token1: ghs_1234567890abcdefghijklmnopqrstuvwx token2: ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+			input:    "token1: ghs_1234567890abcdefghijklmnopqrstuvwx token2: ghp_abcdefghijklmnopqrstuvwxyz1234567890", // notsecret
 			expected: "token1: *** token2: ***",
 		},
 		{

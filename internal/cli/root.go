@@ -35,6 +35,9 @@ Authenticate with GITHUB_TOKEN, GH_TOKEN, or --token.`,
 
 	// Add subcommands
 	rootCmd.AddCommand(
+		newCherryPickCommand(),
+		newStatusCommand(),
+		newInitCommand(),
 		newVersionCommand(),
 	)
 

@@ -1,0 +1,50 @@
+version: 2
+
+builds:
+  - id: pronto-cli
+    main: ./cmd/cli
+    binary: pronto
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/theakshaypant/pronto/internal/cli.Version={{.Version}}
+      - -X github.com/theakshaypant/pronto/internal/cli.Commit={{.Commit}}
+      - -X github.com/theakshaypant/pronto/internal/cli.Date={{.Date}}
+
+archives:
+  - id: pronto-cli
+    builds:
+      - pronto-cli
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: "pronto_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  use: github-native
+
+release:
+  github:
+    owner: theakshaypant
+    name: pronto
+  make_latest: true
+  header: |
+    ### Install
+
+    ```bash
+    go install github.com/theakshaypant/pronto/cmd/cli@{{ .Tag }}
+    ```
+
+    Or download a binary from the assets below.

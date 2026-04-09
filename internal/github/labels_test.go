@@ -155,17 +155,17 @@ func TestParseBranchSpec(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseBranchSpec(tt.spec)
+			result := ParseBranchSpec(tt.spec)
 
 			if tt.wantNil {
 				if result != nil {
-					t.Errorf("parseBranchSpec() = %+v, want nil", result)
+					t.Errorf("ParseBranchSpec() = %+v, want nil", result)
 				}
 				return
 			}
 
 			if result == nil {
-				t.Fatalf("parseBranchSpec() = nil, want non-nil")
+				t.Fatalf("ParseBranchSpec() = nil, want non-nil")
 			}
 
 			if result.Name != tt.wantName {

@@ -4,14 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/google/go-github/v81/github"
 	"github.com/theakshaypant/pronto/internal/action"
+	"github.com/theakshaypant/pronto/internal/cherrypick"
 	"github.com/theakshaypant/pronto/internal/deduplication"
-	"github.com/theakshaypant/pronto/internal/git"
 	ghclient "github.com/theakshaypant/pronto/internal/github"
 	"github.com/theakshaypant/pronto/internal/permissions"
 	"github.com/theakshaypant/pronto/pkg/models"
@@ -169,72 +167,10 @@ func (p *PRProcessor) Process(action EventAction) error {
 }
 
 // processTargetBranch handles cherry-picking to a single target branch.
+// It delegates the core logic to the cherrypick.Service.
 func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHAs, commitMessages []string, hasWriteAccess bool) ProcessResult {
 	pr := p.event.PullRequest
 	targetBranch := target.Name
-
-	// Check if target branch exists
-	exists, err := p.ghClient.BranchExists(p.ctx, targetBranch)
-	if err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to check if branch exists: %v", err),
-		}
-	}
-
-	// Handle branch creation if specified with .. notation
-	if !exists && target.ShouldCreate {
-		log.Printf("Branch %s does not exist, creating from %s", targetBranch, target.BaseBranch)
-
-		// Verify base branch exists
-		baseExists, err := p.ghClient.BranchExists(p.ctx, target.BaseBranch)
-		if err != nil {
-			return ProcessResult{
-				TargetBranch: targetBranch,
-				Success:      false,
-				Message:      fmt.Sprintf("❌ Failed to check if base branch `%s` exists: %v", target.BaseBranch, err),
-			}
-		}
-
-		if !baseExists {
-			return ProcessResult{
-				TargetBranch: targetBranch,
-				Success:      false,
-				Message:      fmt.Sprintf("⚠️ Cannot create branch because the base branch `%s` does not exist. Please check the label format or create the base branch first.", target.BaseBranch),
-			}
-		}
-
-		// Get base branch SHA
-		baseSHA, err := p.ghClient.GetBranchSHA(p.ctx, target.BaseBranch)
-		if err != nil {
-			return ProcessResult{
-				TargetBranch: targetBranch,
-				Success:      false,
-				Message:      fmt.Sprintf("❌ Failed to get base branch SHA: %v", err),
-			}
-		}
-
-		// Create the target branch
-		if err := p.ghClient.CreateBranch(p.ctx, targetBranch, baseSHA); err != nil {
-			return ProcessResult{
-				TargetBranch: targetBranch,
-				Success:      false,
-				Message:      fmt.Sprintf("❌ Failed to create target branch: %v", err),
-			}
-		}
-
-		log.Printf("Successfully created branch %s from %s", targetBranch, target.BaseBranch)
-		// Continue processing to cherry-pick to the newly created branch
-	} else if !exists {
-		// Branch doesn't exist and no .. notation specified
-		log.Printf("Branch %s does not exist", targetBranch)
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("⚠️ Branch does not exist. Use label `%s%s..base-branch` to create it automatically.", p.config.LabelPattern, targetBranch),
-		}
-	}
 
 	// Check deduplication - prevent processing the same PR/branch/SHA combination
 	headSHA := pr.GetHead().GetSHA()
@@ -250,311 +186,32 @@ func (p *PRProcessor) processTargetBranch(target *models.TargetBranch, commitSHA
 	// Mark as processed to prevent duplicate processing from webhook retries
 	defer p.tracker.MarkProcessed(pr.GetNumber(), targetBranch, headSHA)
 
-	// Create temporary directory for git operations
-	tempDir, err := os.MkdirTemp("", "pronto-*")
-	if err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create temp directory: %v", err),
-		}
-	}
-	defer os.RemoveAll(tempDir)
-
-	repoDir := filepath.Join(tempDir, "repo")
-
-	// Clone repository
-	log.Printf("Cloning repository to %s", repoDir)
-	repo, err := git.Clone(git.CloneOptions{
-		URL:       p.event.Repo.GetCloneURL(),
-		Token:     p.config.GitHubToken,
-		Directory: repoDir,
-		Depth:     0, // Full clone needed for cherry-pick
-	})
-	if err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to clone repository: %v", err),
-		}
+	// Build options for the cherry-pick service
+	opts := cherrypick.CherryPickOptions{
+		Owner:          p.event.Repo.GetOwner().GetLogin(),
+		Repo:           p.event.Repo.GetName(),
+		CloneURL:       p.event.Repo.GetCloneURL(),
+		Token:          p.config.GitHubToken,
+		PRNumber:       pr.GetNumber(),
+		TargetBranch:   target,
+		CommitSHAs:     commitSHAs,
+		CommitMessages: commitMessages,
+		HasWriteAccess: hasWriteAccess,
+		AlwaysCreatePR: p.config.AlwaysCreatePR,
+		BotName:        p.config.BotName,
+		BotEmail:       p.config.BotEmail,
+		ConflictLabel:  p.config.ConflictLabel,
+		LabelPattern:   p.config.LabelPattern,
 	}
 
-	// Configure git user
-	if err := repo.ConfigUser(p.config.BotName, p.config.BotEmail); err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to configure git user: %v", err),
-		}
-	}
-
-	// Checkout target branch
-	log.Printf("Checking out target branch: %s", targetBranch)
-	if err := repo.Checkout(targetBranch); err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to checkout target branch: %v", err),
-		}
-	}
-
-	// Perform cherry-pick
-	log.Printf("Cherry-picking %d commit(s)", len(commitSHAs))
-	result, err := repo.CherryPick(commitSHAs...)
-	if err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Cherry-pick operation failed: %v", err),
-		}
-	}
-
-	// Handle result
-	if result.Success {
-		return p.handleSuccessfulCherryPick(repo, target, commitMessages, hasWriteAccess)
-	}
-
-	return p.handleConflictedCherryPick(repo, targetBranch, commitMessages, result, pr.GetNumber(), target.TagName)
-}
-
-// handleSuccessfulCherryPick handles a successful cherry-pick.
-func (p *PRProcessor) handleSuccessfulCherryPick(repo *git.Repository, target *models.TargetBranch, commitMessages []string, hasWriteAccess bool) ProcessResult {
-	pr := p.event.PullRequest
-	targetBranch := target.Name
-
-	if hasWriteAccess && !p.config.AlwaysCreatePR {
-		// User has write access and always_create_pr is not enabled - push directly
-		log.Printf("Pushing cherry-picked commits to %s", targetBranch)
-		if err := repo.Push("origin", targetBranch, false); err != nil {
-			return ProcessResult{
-				TargetBranch: targetBranch,
-				Success:      false,
-				Message:      fmt.Sprintf("❌ Failed to push to target branch: %s", git.SanitizeError(err)),
-			}
-		}
-
-		log.Printf("Successfully cherry-picked to %s", targetBranch)
-
-		// Create tag if specified
-		if target.TagName != "" {
-			log.Printf("Creating tag %s for branch %s", target.TagName, targetBranch)
-
-			tagMessage := fmt.Sprintf("Cherry-picked PR #%d to %s\n\nOriginal PR: #%d\nCommits: %d",
-				pr.GetNumber(), targetBranch, pr.GetNumber(), len(commitMessages))
-
-			if err := repo.CreateTag(target.TagName, tagMessage); err != nil {
-				// Tag creation failed - log but don't fail the whole operation
-				log.Printf("Failed to create tag %s: %v", target.TagName, err)
-				return ProcessResult{
-					TargetBranch: targetBranch,
-					Success:      false,
-					Message:      fmt.Sprintf("❌ Cherry-pick succeeded but tag creation failed: %v", err),
-				}
-			}
-
-			// Push the tag
-			if err := repo.PushTag("origin", target.TagName); err != nil {
-				log.Printf("Failed to push tag %s: %v", target.TagName, git.SanitizeError(err))
-				return ProcessResult{
-					TargetBranch: targetBranch,
-					Success:      false,
-					Message:      fmt.Sprintf("❌ Cherry-pick and tag creation succeeded but tag push failed: %s", git.SanitizeError(err)),
-				}
-			}
-
-			log.Printf("Successfully created and pushed tag %s", target.TagName)
-		}
-
-		// Build success message
-		msg := fmt.Sprintf("✅ Successfully cherry-picked %d commit(s)", len(commitMessages))
-		if target.ShouldCreate {
-			msg = fmt.Sprintf("✅ Created branch from `%s` and cherry-picked %d commit(s)", target.BaseBranch, len(commitMessages))
-		}
-		if target.TagName != "" {
-			msg += fmt.Sprintf(", created tag `%s`", target.TagName)
-		}
-
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      true,
-			Message:      msg,
-		}
-	}
-
-	// Create PR (either user lacks write access or always_create_pr is enabled)
-	reason := "user lacks write access"
-	if p.config.AlwaysCreatePR {
-		reason = "always_create_pr is enabled"
-	}
-	log.Printf("Creating PR (%s)", reason)
-	return p.createCherryPickPR(repo, target, commitMessages, "", pr.GetNumber())
-}
-
-// handleConflictedCherryPick handles a cherry-pick with conflicts.
-func (p *PRProcessor) handleConflictedCherryPick(repo *git.Repository, targetBranch string, commitMessages []string, result *git.CherryPickResult, prNumber int, tagName string) ProcessResult {
-	log.Printf("Cherry-pick resulted in conflicts for branch %s", targetBranch)
-
-	// Get conflict details while we still have the conflicts in working tree
-	details, err := repo.GetConflictDetails()
-	if err != nil {
-		log.Printf("Failed to get conflict details: %v", err)
-		details = fmt.Sprintf("Conflicts in %d file(s)", len(result.ConflictedFiles))
-	}
-
-	// Stage all files (including conflicts with markers)
-	// This must be done while still in the conflicted cherry-pick state
-	if err := repo.StageAll(); err != nil {
-		// Abort cherry-pick before returning
-		repo.AbortCherryPick()
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to stage conflicted files: %v", err),
-		}
-	}
-
-	// Commit the conflicts to complete the cherry-pick
-	// This creates a commit with conflict markers that can be resolved later
-	commitMsg := fmt.Sprintf("Cherry-pick PR #%d to %s (conflicts)\n\nConflicts need manual resolution", prNumber, targetBranch)
-	if err := repo.Commit(commitMsg); err != nil {
-		// Abort cherry-pick before returning
-		repo.AbortCherryPick()
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to commit conflicts: %v", err),
-		}
-	}
-
-	// Now create a new branch from this commit
-	conflictBranch := fmt.Sprintf("pronto/%s/pr-%d-conflicts", targetBranch, prNumber)
-	log.Printf("Creating conflict branch: %s", conflictBranch)
-
-	if err := repo.CreateBranch(conflictBranch); err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create conflict branch: %v", err),
-		}
-	}
-
-	// Push the conflict branch (force push in case it exists from a previous attempt)
-	log.Printf("Pushing conflict branch to origin (force)")
-	if err := repo.Push("origin", conflictBranch, true); err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to push conflict branch: %s", git.SanitizeError(err)),
-		}
-	}
-
-	// Checkout back to the base branch and reset it to remove the conflict commit
-	// We want the base branch clean, with only the conflict branch having the markers
-	if err := repo.Checkout(targetBranch); err != nil {
-		log.Printf("Warning: Failed to checkout back to %s: %v", targetBranch, err)
-	} else {
-		// Reset to HEAD~1 to remove the conflict commit we just created
-		if err := repo.ResetHard("HEAD~1"); err != nil {
-			log.Printf("Warning: Failed to reset %s: %v", targetBranch, err)
-		}
-	}
-
-	// Create PR with conflict label
-	prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch, commitMessages, details, tagName)
-	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s (CONFLICTS)", prNumber, targetBranch)
-
-	labels := []string{"pronto", p.config.ConflictLabel}
-
-	newPR, err := p.ghClient.CreatePullRequest(p.ctx, ghclient.PROptions{
-		Title:  prTitle,
-		Body:   prBody,
-		Head:   conflictBranch,
-		Base:   targetBranch,
-		Labels: labels,
-	})
-	if err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create conflict PR: %v", err),
-		}
-	}
-
-	log.Printf("Created conflict PR #%d", newPR.GetNumber())
+	svc := cherrypick.NewService(p.ctx, p.ghClient)
+	result := svc.CherryPickToTarget(opts)
 
 	return ProcessResult{
-		TargetBranch: targetBranch,
-		Success:      false,
-		Message:      fmt.Sprintf("⚠️ Conflicts detected - created PR #%d for manual resolution", newPR.GetNumber()),
-	}
-}
-
-// createCherryPickPR creates a PR for cherry-picked changes.
-func (p *PRProcessor) createCherryPickPR(repo *git.Repository, target *models.TargetBranch, commitMessages []string, conflictDetails string, prNumber int) ProcessResult {
-	targetBranch := target.Name
-	// Create a new branch for the cherry-pick PR
-	branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch, prNumber)
-
-	log.Printf("Creating cherry-pick branch: %s", branchName)
-	if err := repo.CreateBranch(branchName); err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create cherry-pick branch: %v", err),
-		}
-	}
-
-	// Push the branch
-	log.Printf("Pushing cherry-pick branch to origin")
-	if err := repo.Push("origin", branchName, false); err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to push cherry-pick branch: %s", git.SanitizeError(err)),
-		}
-	}
-
-	// Create PR
-	prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch, commitMessages, conflictDetails, target.TagName)
-	prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", prNumber, targetBranch)
-
-	// Always add "pronto" label to identify auto-created PRs
-	labels := []string{"pronto"}
-	if conflictDetails != "" {
-		labels = append(labels, p.config.ConflictLabel)
-	}
-
-	newPR, err := p.ghClient.CreatePullRequest(p.ctx, ghclient.PROptions{
-		Title:  prTitle,
-		Body:   prBody,
-		Head:   branchName,
-		Base:   targetBranch,
-		Labels: labels,
-	})
-	if err != nil {
-		return ProcessResult{
-			TargetBranch: targetBranch,
-			Success:      false,
-			Message:      fmt.Sprintf("❌ Failed to create cherry-pick PR: %v", err),
-		}
-	}
-
-	log.Printf("Created cherry-pick PR #%d", newPR.GetNumber())
-
-	// Build success message
-	msg := fmt.Sprintf("✅ Created PR #%d", newPR.GetNumber())
-	if target.ShouldCreate {
-		msg = fmt.Sprintf("✅ Created branch from `%s` and created PR #%d", target.BaseBranch, newPR.GetNumber())
-	}
-	if target.TagName != "" {
-		msg += fmt.Sprintf(" (tag `%s` pending merge)", target.TagName)
-	}
-
-	return ProcessResult{
-		TargetBranch: targetBranch,
-		Success:      true,
-		Message:      msg,
-		CreatedPR:    newPR.GetNumber(),
+		TargetBranch: result.TargetBranch,
+		Success:      result.Success,
+		Message:      result.Message,
+		CreatedPR:    result.CreatedPR,
 	}
 }
 
@@ -748,184 +405,55 @@ func (p *PRProcessor) processTrackingIssue(trackingIssue *TrackingIssue, prNumbe
 		hasWriteAccess = false
 	}
 
-	// Process each target branch
+	// Process each target branch using the cherry-pick service
+	svc := cherrypick.NewService(p.ctx, p.ghClient)
+
 	var results []BatchResult
 	for _, targetBranch := range targetBranches {
 		log.Printf("Processing target branch: %s for PR #%d", targetBranch.Name, prNumber)
 
-		result := BatchResult{
-			PRNumber:     prNumber,
-			TargetBranch: targetBranch.Name,
-		}
-
 		// Check deduplication
 		if p.tracker.IsProcessed(prNumber, targetBranch.Name, pr.GetHead().GetSHA()) {
 			log.Printf("Skipping duplicate processing for PR #%d to %s", prNumber, targetBranch.Name)
-			result.Success = false
-			result.Status = "skipped"
-			result.Message = "Already processed (duplicate)"
-			results = append(results, result)
+			results = append(results, BatchResult{
+				PRNumber:     prNumber,
+				TargetBranch: targetBranch.Name,
+				Success:      false,
+				Status:       "skipped",
+				Message:      "Already processed (duplicate)",
+			})
 			continue
 		}
 
 		// Mark as processed
 		p.tracker.MarkProcessed(prNumber, targetBranch.Name, pr.GetHead().GetSHA())
 
-		// Create temporary directory for git operations
-		tempDir, err := os.MkdirTemp("", "pronto-*")
-		if err != nil {
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Failed to create temp directory: %v", err)
-			results = append(results, result)
-			continue
+		opts := cherrypick.CherryPickOptions{
+			Owner:          p.event.Repo.GetOwner().GetLogin(),
+			Repo:           p.event.Repo.GetName(),
+			CloneURL:       p.event.Repo.GetCloneURL(),
+			Token:          p.config.GitHubToken,
+			PRNumber:       prNumber,
+			TargetBranch:   targetBranch,
+			CommitSHAs:     commitSHAs,
+			CommitMessages: commitMessages,
+			HasWriteAccess: hasWriteAccess,
+			AlwaysCreatePR: p.config.AlwaysCreatePR,
+			BotName:        p.config.BotName,
+			BotEmail:       p.config.BotEmail,
+			ConflictLabel:  p.config.ConflictLabel,
+			LabelPattern:   p.config.LabelPattern,
 		}
 
-		repoDir := filepath.Join(tempDir, "repo")
-
-		// Clone repository
-		log.Printf("Cloning repository to %s", repoDir)
-		repo, err := git.Clone(git.CloneOptions{
-			URL:       p.event.Repo.GetCloneURL(),
-			Token:     p.config.GitHubToken,
-			Directory: repoDir,
-			Depth:     0, // Full clone needed for cherry-pick
+		cpResult := svc.CherryPickToTarget(opts)
+		results = append(results, BatchResult{
+			PRNumber:     cpResult.PRNumber,
+			TargetBranch: cpResult.TargetBranch,
+			Success:      cpResult.Success,
+			Status:       cpResult.Status,
+			Message:      cpResult.Message,
+			CreatedPR:    cpResult.CreatedPR,
 		})
-		if err != nil {
-			os.RemoveAll(tempDir)
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Failed to clone repository: %v", git.SanitizeError(err))
-			results = append(results, result)
-			continue
-		}
-
-		// Configure git user
-		if err := repo.ConfigUser(p.config.BotName, p.config.BotEmail); err != nil {
-			os.RemoveAll(tempDir)
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Failed to configure git: %v", err)
-			results = append(results, result)
-			continue
-		}
-
-		// Check if target branch exists
-		branchExists, err := p.ghClient.BranchExists(p.ctx, targetBranch.Name)
-		if err != nil {
-			os.RemoveAll(tempDir)
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Failed to check branch existence: %v", err)
-			results = append(results, result)
-			continue
-		}
-
-		if !branchExists {
-			os.RemoveAll(tempDir)
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Target branch '%s' does not exist", targetBranch.Name)
-			results = append(results, result)
-			continue
-		}
-
-		// Checkout target branch
-		if err := repo.Checkout(targetBranch.Name); err != nil {
-			os.RemoveAll(tempDir)
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Failed to checkout branch: %v", err)
-			results = append(results, result)
-			continue
-		}
-
-		// Perform cherry-pick
-		cherryPickResult, err := repo.CherryPick(commitSHAs...)
-		if err != nil {
-			os.RemoveAll(tempDir)
-			result.Success = false
-			result.Status = "failed"
-			result.Message = fmt.Sprintf("Cherry-pick failed: %v", err)
-			results = append(results, result)
-			continue
-		}
-
-		if !cherryPickResult.Success {
-			os.RemoveAll(tempDir)
-			// Conflicts - for now just report
-			result.Success = false
-			result.Status = "conflict"
-			result.Message = fmt.Sprintf("Conflicts in %d file(s) - manual cherry-pick needed", len(cherryPickResult.ConflictedFiles))
-			results = append(results, result)
-			continue
-		}
-
-		// Push changes or create PR
-		if hasWriteAccess && !p.config.AlwaysCreatePR {
-			// Push directly
-			if err := repo.Push("origin", targetBranch.Name, false); err != nil {
-				os.RemoveAll(tempDir)
-				result.Success = false
-				result.Status = "failed"
-				result.Message = fmt.Sprintf("Failed to push: %s", git.SanitizeError(err))
-				results = append(results, result)
-				continue
-			}
-
-			result.Success = true
-			result.Status = "success"
-			result.Message = fmt.Sprintf("Cherry-picked %d commit(s)", len(commitMessages))
-		} else {
-			// Create PR
-			branchName := fmt.Sprintf("pronto/%s/pr-%d", targetBranch.Name, prNumber)
-			if err := repo.CreateBranch(branchName); err != nil {
-				os.RemoveAll(tempDir)
-				result.Success = false
-				result.Status = "failed"
-				result.Message = fmt.Sprintf("Failed to create branch: %v", err)
-				results = append(results, result)
-				continue
-			}
-
-			if err := repo.Push("origin", branchName, false); err != nil {
-				os.RemoveAll(tempDir)
-				result.Success = false
-				result.Status = "failed"
-				result.Message = fmt.Sprintf("Failed to push: %s", git.SanitizeError(err))
-				results = append(results, result)
-				continue
-			}
-
-			// Create the PR
-			prBody := ghclient.FormatConflictPRBody(prNumber, targetBranch.Name, commitMessages, "", "")
-			prTitle := fmt.Sprintf("[PROnto] Cherry-pick PR #%d to %s", prNumber, targetBranch.Name)
-
-			newPR, err := p.ghClient.CreatePullRequest(p.ctx, ghclient.PROptions{
-				Title:  prTitle,
-				Body:   prBody,
-				Head:   branchName,
-				Base:   targetBranch.Name,
-				Labels: []string{"pronto"},
-			})
-			if err != nil {
-				os.RemoveAll(tempDir)
-				result.Success = false
-				result.Status = "failed"
-				result.Message = fmt.Sprintf("Failed to create PR: %v", err)
-				results = append(results, result)
-				continue
-			}
-
-			result.Success = false // Pending PR merge
-			result.Status = "pending_pr"
-			result.Message = "Cherry-pick PR created"
-			result.CreatedPR = newPR.GetNumber()
-		}
-
-		// Clean up
-		os.RemoveAll(tempDir)
-		results = append(results, result)
 	}
 
 	// Update the tracking issue status table

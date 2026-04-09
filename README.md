@@ -33,7 +33,96 @@ Want to see what actually happens? Check out the [test repository](https://githu
 
 If you have write access, it pushes directly. If not, it creates a PR for you. If there's a conflict, it creates a conflict PR with resolution instructions.
 
-## Setup
+## CLI
+
+PROnto is also available as a CLI tool for cherry-picking from your terminal.
+
+### Install
+
+```bash
+# Go install
+go install github.com/theakshaypant/pronto/cmd/cli@latest
+
+# Or download from releases
+# https://github.com/theakshaypant/pronto/releases
+```
+
+### Authentication
+
+Set `GITHUB_TOKEN` or `GH_TOKEN` environment variable, or use `--token`:
+
+```bash
+export GITHUB_TOKEN=ghp_...
+```
+
+You can also store the token in `~/.config/pronto/config.yml`:
+
+```yaml
+token: ghp_...
+```
+
+### Commands
+
+**Cherry-pick a PR to one or more branches:**
+
+```bash
+pronto cherry-pick --pr 123 --to release-1.0
+pronto cherry-pick --pr 123 --to release-1.0 --to release-2.0
+```
+
+**Multiple PRs at once:**
+
+```bash
+pronto cherry-pick --pr 123 --pr 456 --to release-1.0 --to release-2.0
+```
+
+**The `--to` flag supports the same spec syntax as labels:**
+
+```bash
+# Create branch from main, then cherry-pick
+pronto cherry-pick --pr 123 --to "release-2.0..main"
+
+# Cherry-pick and create a tag
+pronto cherry-pick --pr 123 --to "release-1.0?tag=v1.0.1"
+
+# Create branch, cherry-pick, and tag
+pronto cherry-pick --pr 123 --to "release-2.0..main?tag=v2.0.0"
+```
+
+**Check cherry-pick status:**
+
+```bash
+pronto status --pr 123
+pronto status --branch release-1.0
+pronto status --pr 123 --format json
+```
+
+**Dry run (see what would happen):**
+
+```bash
+pronto cherry-pick --pr 123 --to release-1.0 --dry-run
+```
+
+**Generate a config file:**
+
+```bash
+pronto init
+```
+
+### Configuration
+
+The CLI reads configuration from (in priority order):
+1. CLI flags
+2. Environment variables (`GITHUB_TOKEN`, `PRONTO_LABEL_PATTERN`, etc.)
+3. `.pronto.yml` in the current directory
+4. `~/.config/pronto/config.yml`
+5. Built-in defaults
+
+The repository is auto-detected from the local git remote. Override with `--repo owner/repo`.
+
+---
+
+## GitHub Action Setup
 
 Create `.github/workflows/pronto.yml`:
 

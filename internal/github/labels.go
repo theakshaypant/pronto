@@ -39,7 +39,7 @@ func ParseTargetBranches(labels []*github.Label, pattern string) []*models.Targe
 		}
 
 		// Parse the branch spec for @ notation
-		targetBranch := parseBranchSpec(branchSpec)
+		targetBranch := ParseBranchSpec(branchSpec)
 		if targetBranch == nil {
 			continue
 		}
@@ -54,13 +54,13 @@ func ParseTargetBranches(labels []*github.Label, pattern string) []*models.Targe
 	return branches
 }
 
-// parseBranchSpec parses a branch specification.
+// ParseBranchSpec parses a branch specification string into a TargetBranch.
 // Formats:
 //   - "release-1.0" -> TargetBranch{Name: "release-1.0"}
 //   - "release-1.0..main" -> TargetBranch{Name: "release-1.0", BaseBranch: "main", ShouldCreate: true}
 //   - "release-1.0?tag=v1.0.1" -> TargetBranch{Name: "release-1.0", TagName: "v1.0.1"}
 //   - "release-1.0..main?tag=v1.0.0" -> TargetBranch{Name: "release-1.0", BaseBranch: "main", ShouldCreate: true, TagName: "v1.0.0"}
-func parseBranchSpec(spec string) *models.TargetBranch {
+func ParseBranchSpec(spec string) *models.TargetBranch {
 	var targetName, baseBranch, tagName string
 	shouldCreate := false
 
